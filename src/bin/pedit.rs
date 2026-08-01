@@ -1,0 +1,1772 @@
+//! pedit —— prospi 選手編輯器（原生視窗 GUI）。
+//!
+//! 左邊選選手、右邊直接拉數值改球種, 不用背 offset 也不用先輸入編號。
+//! 栄冠(高中)走指標鏈即時列出部員; 明星選手模式沒有指標鏈, 用全記憶體掃描列出。
+//! 所有修改即時寫入記憶體, 遊戲切換畫面後生效。
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+use eframe::egui;
+use prospi::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::{Arc, Mutex};
+
+/// 鎖定目標 ＝ 一位選手的一整組「顯示能力值」。
+///
+/// ⚠ 明星選手模式的能力值有一份**權威來源**（成長／經驗值資料），
+/// 我們改的是它算出來的結果。打完比賽或推進日期時遊戲會重新結算並覆寫，
+/// 而且會把差值當成「力量已下降 23 了！」報告出來 —— 所以單次寫入撐不到下一場。
+/// 對策跟道具一樣：**持續重寫**，遊戲蓋回去就在 0.3 秒內再蓋回來。
+#[derive(Clone)]
+struct LockTarget {
+    addr: usize,
+    /// 寫入前拿來比對，防止物件搬家後寫進別人的資料
+    name: String,
+    stats: [u8; 8],
+    defense: u8,
+    speed: u16,
+    stamina: u16,
+    pack_hi: u16,
+    abil: [u8; ABIL_BYTES],
+    /// 12 slot × 3 bytes，已編碼成記憶體的樣子
+    balls: Vec<u8>,
+}
+
+impl LockTarget {
+    fn of(pl: &Player) -> LockTarget {
+        LockTarget {
+            addr: pl.addr,
+            name: pl.name.clone(),
+            stats: pl.stats,
+            defense: pl.defense,
+            speed: pl.speed,
+            stamina: pl.stamina,
+            pack_hi: pl.pack_hi,
+            abil: pl.abil,
+            balls: pl
+                .balls
+                .iter()
+                .flat_map(|b| [b.id, b.power * 8 + b.move_, b.control])
+                .collect(),
+        }
+    }
+}
+
+/// 常規作弊開關。全部走「背景執行緒每 0.3 秒重寫一次」，
+/// 因為這些值遊戲會自己扣（道具消耗、使用次數累加），單次寫入撐不住。
+/// 這也免掉了 hook 程式碼 —— 效果等同 CT 那幾個 AA 腳本，但不必動到 exe。
+#[derive(Default)]
+struct Cheats {
+    koshien_items: AtomicBool,
+    koshien_limit: AtomicBool,
+    koshien_prac: AtomicBool,
+    shared_items: AtomicBool,
+    star_items: AtomicBool,
+    /// 鎖定選中的選手（對抗明星選手模式的成長結算回寫）
+    lock_player: AtomicBool,
+    /// 連球種一起鎖（預設關 —— 否則在遊戲內學到的新球種也會被蓋掉）
+    lock_balls: AtomicBool,
+    /// 鎖定目標。None ＝ 還沒指定
+    lock: Mutex<Option<LockTarget>>,
+    /// 上一輪姓名比對失敗 ＝ 物件搬家了（讀過存檔／遊戲重開），UI 要提示重新掃描
+    lock_stale: AtomicBool,
+    /// 心跳：套用過幾輪，讓 UI 能顯示「有在跑」
+    ticks: AtomicUsize,
+}
+
+impl Cheats {
+    fn any_on(&self) -> bool {
+        [&self.koshien_items, &self.koshien_limit, &self.koshien_prac,
+         &self.shared_items, &self.star_items, &self.lock_player]
+            .iter()
+            .any(|f| f.load(Ordering::Relaxed))
+    }
+}
+
+/// 背景套用執行緒。自己持有 Proc 並在遊戲重開後重新附加，
+/// 不跟 UI 那條共用 —— 否則使用者按「重新附加」時會打架。
+fn spawn_cheat_worker(c: Arc<Cheats>) {
+    std::thread::spawn(move || {
+        let mut proc: Option<Proc> = None;
+        loop {
+            if c.any_on() {
+                let alive = proc.as_ref().is_some_and(|p: &Proc| {
+                    matches!(p.read(p.base, 2), Some(b) if b == [0x4D, 0x5A])
+                });
+                if !alive {
+                    proc = Proc::attach().ok();
+                }
+                if let Some(p) = &proc {
+                    // 不在對應模式時這些會靜靜失敗（指標鏈是 0），不必特別處理
+                    if c.koshien_items.load(Ordering::Relaxed) {
+                        set_koshien_items(p, 99);
+                    }
+                    if c.koshien_limit.load(Ordering::Relaxed) {
+                        clear_koshien_use_limits(p);
+                    }
+                    // 平時一天才減 1，但**觸發經理事件時遊戲會把它夾回 99**，
+                    // 所以還是得持續蓋回去
+                    if c.koshien_prac.load(Ordering::Relaxed) {
+                        set_koshien_pracbuff(p, KOSHIEN_PRACBUFF_DAYS);
+                    }
+                    if c.shared_items.load(Ordering::Relaxed) {
+                        set_shared_items(p, 99);
+                    }
+                    if c.lock_player.load(Ordering::Relaxed) {
+                        apply_lock(p, &c);
+                    }
+                    c.ticks.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        }
+    });
+}
+
+/// 把鎖定目標的數值寫回去。
+///
+/// ⚠ **每次寫入前都要比對姓名** —— 明星選手模式讀取存檔後物件會整批搬家，
+/// 平移量還不固定，拿舊位址硬寫會寫進別人的資料（`sane_name` 那段註解記的就是這個坑）。
+fn apply_lock(p: &Proc, c: &Cheats) {
+    let t = match c.lock.lock() {
+        Ok(g) => match g.as_ref() {
+            Some(t) => t.clone(),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    let live = read_name(p, t.addr);
+    if live != t.name || !sane_name(&live) {
+        c.lock_stale.store(true, Ordering::Relaxed);
+        return;
+    }
+    write_pack(p, t.addr, t.speed, t.stamina, t.pack_hi);
+    p.write(t.addr + OFF_STATS, &t.stats);
+    p.write(t.addr + OFF_DEF, &[t.defense]);
+    p.write(t.addr + OFF_ABIL2, &t.abil);
+    if c.lock_balls.load(Ordering::Relaxed) {
+        p.write(t.addr + OFF_BALL, &t.balls);
+    }
+    c.lock_stale.store(false, Ordering::Relaxed);
+}
+
+fn cheat_box(ui: &mut egui::Ui, flag: &AtomicBool, text: &str, hint: &str) {
+    let mut v = flag.load(Ordering::Relaxed);
+    if ui.checkbox(&mut v, text).on_hover_text(hint).changed() {
+        flag.store(v, Ordering::Relaxed);
+    }
+}
+
+const FONT_CANDIDATES: &[&str] = &[
+    "C:/Windows/Fonts/msjh.ttc",
+    "C:/Windows/Fonts/msyh.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/mingliu.ttc",
+    "C:/Windows/Fonts/simsun.ttc",
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/kaiu.ttf",
+];
+
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut added = Vec::new();
+    for (i, path) in FONT_CANDIDATES.iter().enumerate() {
+        if let Ok(bytes) = std::fs::read(path) {
+            let key = format!("cjk{i}");
+            fonts.font_data.insert(key.clone(), egui::FontData::from_owned(bytes));
+            added.push(key);
+        }
+    }
+    if added.is_empty() {
+        return; // 沒有 CJK 字型就用預設（中文會變豆腐, 但不至於當掉）
+    }
+    for fam in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        let list = fonts.families.entry(fam).or_default();
+        for (n, key) in added.iter().enumerate() {
+            list.insert(n, key.clone());
+        }
+    }
+    ctx.set_fonts(fonts);
+}
+
+enum ScanMsg {
+    Progress(usize, usize),
+    Done(Vec<Player>),
+    Failed(String),
+}
+
+#[derive(PartialEq, Clone, Copy)]
+enum Mode {
+    Koshien,
+    /// 明星選手：全記憶體掃描列出所有選手（約 100 秒）
+    Scan,
+    /// 明星選手：**只找主角**。用門檻表 AOB 先掃熱區（0xd0000000~0xf0000000），
+    /// 命中 −0xB014 ＝ 主角物件。約 5 秒，不必等全掃。
+    Star,
+}
+
+struct App {
+    proc: Option<Proc>,
+    err: String,
+    mode: Mode,
+    filter: String,
+    list: Vec<Player>,
+    sel: Option<usize>,
+    cur: Option<Player>,
+    lib: Vec<LibEntry>,
+    /// `origlib.json` 的位置 —— 「蒐集到球種庫」要寫回這裡
+    libpath: std::path::PathBuf,
+    /// 隊伍 ID → 隊名（記憶體裡查不到，使用者自己填，存 `teams.json`）
+    teams: std::collections::HashMap<u8, String>,
+    rename_team: Option<u8>,
+    /// 合併同名副本（同隊同名只留一份）
+    merge_dups: bool,
+    /// (隊伍, 姓名) → (代表的 index, 總份數)。在 reload 時算一次 ——
+    /// ⚠ 這裡面要讀記憶體判斷成長經驗值結構，**絕對不能放進每幀路徑**
+    dup_rep: std::collections::HashMap<(u8, String), (usize, usize)>,
+    /// 帶成長經驗值結構的物件 ＝ 明星選手的主角。清單上標 ★，代表選這份才對。
+    growth_owners: std::collections::HashSet<usize>,
+    rename_buf: String,
+    scan_rx: Option<Receiver<ScanMsg>>,
+    scan_prog: (usize, usize),
+    status: String,
+    cross_dir: bool,
+    only_pitchers: bool,
+    /// 成長經驗值要練到幾（0..99）。不是無腦灌滿, 可以指定
+    growth_target: i32,
+    /// 道具 patch 指令的位址。**AOB 掃 869MB 程式碼段, 絕對不能每幀做** ——
+    /// 找到一次就快取, 之後只讀那 2 bytes 判斷狀態。
+    /// （2026-08-01 就是把它放在每幀執行的地方, UI 直接卡死。）
+    item_patch_addr: Option<usize>,
+    item_patch_scanned: bool,
+    /// 目前選中選手的成長經驗值結構（在 reload_current 時算好, 不要每幀重算）
+    growth_base: Option<usize>,
+    cheats: Arc<Cheats>,
+}
+
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_fonts(&cc.egui_ctx);
+        let libpath = origlib_path();
+        let (proc, err) = match Proc::attach() {
+            Ok(p) => (Some(p), String::new()),
+            Err(e) => (None, e),
+        };
+        let mut app = App {
+            proc,
+            err,
+            mode: Mode::Koshien,
+            filter: String::new(),
+            list: Vec::new(),
+            sel: None,
+            cur: None,
+            lib: load_lib(&libpath),
+            libpath,
+            teams: load_teams(&teams_path()),
+            rename_team: None,
+            merge_dups: true,
+            dup_rep: std::collections::HashMap::new(),
+            growth_owners: std::collections::HashSet::new(),
+            rename_buf: String::new(),
+            scan_rx: None,
+            scan_prog: (0, 0),
+            status: String::new(),
+            cross_dir: false,
+            only_pitchers: false,
+            growth_target: 99,
+            item_patch_addr: None,
+            item_patch_scanned: false,
+            growth_base: None,
+            cheats: Arc::new(Cheats::default()),
+        };
+        spawn_cheat_worker(app.cheats.clone());
+        app.reload_list();
+        app
+    }
+
+    /// 現有 handle 是否還指向活著的遊戲行程。
+    /// 遊戲重開後 pid 會變，舊 handle 讀什麼都回 None —— 讀模組基址的 `MZ` 就能判斷。
+    fn proc_alive(&self) -> bool {
+        match &self.proc {
+            Some(p) => matches!(p.read(p.base, 2), Some(b) if b == [0x4D, 0x5A]),
+            None => false,
+        }
+    }
+
+    /// 附加失效就自動重新附加。**每次重新整理／切模式前都要跑**，
+    /// 否則使用者關掉遊戲重讀存檔後會一直看到「讀不到部員名單」而不知道是 pid 變了。
+    fn ensure_proc(&mut self) -> bool {
+        if self.proc_alive() {
+            return true;
+        }
+        let old = self.proc.take().map(|p| p.pid);
+        match Proc::attach() {
+            Ok(p) => {
+                self.status = match old {
+                    Some(o) => format!("遊戲已重開（pid {o} → {}），已自動重新附加", p.pid),
+                    None => format!("已附加 pid {}", p.pid),
+                };
+                self.proc = Some(p);
+                self.err.clear();
+                true
+            }
+            Err(e) => {
+                self.err = e;
+                self.sel = None;
+                self.cur = None;
+                self.list.clear();
+                false
+            }
+        }
+    }
+
+    fn reload_list(&mut self) {
+        if !self.ensure_proc() {
+            return;
+        }
+        let p = match &self.proc {
+            Some(p) => p,
+            None => return,
+        };
+        match self.mode {
+            Mode::Koshien => {
+                let objs = koshien_roster(p);
+                if objs.is_empty() {
+                    self.status =
+                        "讀不到部員名單 —— 現在不在栄冠(高中)模式? 可改用「明星選手(掃描)」".into();
+                }
+                self.list = objs.iter().filter_map(|&o| Player::load(p, o)).collect();
+                self.sel = None;
+                self.cur = None;
+            }
+            Mode::Scan => self.start_scan(false),
+            Mode::Star => self.start_scan(true),
+        }
+        self.rebuild_dups();
+    }
+
+    /// 算出每位選手（同隊同名）要用哪一份當代表。**只在 reload 時跑一次。**
+    ///
+    /// 挑選順序：
+    /// 1. **有成長經驗值結構（`+0xB014`）的那份** —— 明星選手的主角是這樣，
+    ///    他的能力值由經驗值算出來，副本會留著舊值。這是結構性判別，最可靠。
+    /// 2. 否則取**位址最小**的那份（12 位對照畫面值中 11 位正確的經驗法則）。
+    fn rebuild_dups(&mut self) {
+        self.dup_rep.clear();
+        self.growth_owners.clear();
+        let mut group: std::collections::HashMap<(u8, String), Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, pl) in self.list.iter().enumerate() {
+            group.entry((pl.team, pl.name.clone())).or_default().push(i);
+        }
+        for (k, mut idxs) in group {
+            idxs.sort_by_key(|&i| self.list[i].addr);
+            let mut rep = idxs[0];
+            if idxs.len() > 1 {
+                if let Some(p) = &self.proc {
+                    // 只對「真的有多份」的選手做記憶體判斷，數量很少
+                    for &i in &idxs {
+                        if growth_struct_for(p, self.list[i].addr).is_some() {
+                            self.growth_owners.insert(i);
+                        }
+                    }
+                    if let Some(&g) = idxs.iter().find(|i| self.growth_owners.contains(i)) {
+                        rep = g;
+                    }
+                }
+            }
+            self.dup_rep.insert(k, (rep, idxs.len()));
+        }
+    }
+
+    fn start_scan(&mut self, fast: bool) {
+        if self.scan_rx.is_some() {
+            return;
+        }
+        let (tx, rx) = channel();
+        self.scan_rx = Some(rx);
+        self.scan_prog = (0, 1);
+        self.status = if fast { "找主角中（約 5 秒）…" } else { "掃描中（約 100 秒）…" }.into();
+        std::thread::spawn(move || match Proc::attach() {
+            Ok(p) => {
+                if fast {
+                    // 主角 ＝ 經驗值結構 − 0xB014。順便去重（同一位主角有多份結構）
+                    let mut v: Vec<Player> = find_growth_structs_fast(&p)
+                        .into_iter()
+                        .filter_map(|g| Player::load(&p, g.checked_sub(GROWTH_FROM_PLAYER)?))
+                        .filter(|pl| sane_name(&pl.name))
+                        .collect();
+                    v.dedup_by(|a, b| a.name == b.name && a.stats == b.stats && a.speed == b.speed);
+                    let _ = tx.send(ScanMsg::Done(v));
+                    return;
+                }
+                let tx2 = tx.clone();
+                let players = scan_players(&p, move |d, t| {
+                    let _ = tx2.send(ScanMsg::Progress(d, t));
+                });
+                let _ = tx.send(ScanMsg::Done(players));
+            }
+            Err(e) => {
+                let _ = tx.send(ScanMsg::Failed(e));
+            }
+        });
+    }
+
+    fn poll_scan(&mut self, ctx: &egui::Context) {
+        let mut done = false;
+        if let Some(rx) = &self.scan_rx {
+            while let Ok(msg) = rx.try_recv() {
+                match msg {
+                    ScanMsg::Progress(d, t) => {
+                        self.scan_prog = (d, t.max(1));
+                        ctx.request_repaint();
+                    }
+                    ScanMsg::Done(v) => {
+                        self.status = format!("掃描完成，找到 {} 位選手", v.len());
+                        self.list = v;
+                        self.sel = None;
+                        self.cur = None;
+                        done = true;
+                    }
+                    ScanMsg::Failed(e) => {
+                        self.status = e;
+                        done = true;
+                    }
+                }
+            }
+        }
+        if done {
+            self.scan_rx = None;
+            // 掃描是背景執行緒, 結果晚到 —— 這裡才是名單真正就緒的時候
+            self.rebuild_dups();
+        }
+    }
+
+    fn reload_current(&mut self) {
+        if let (Some(p), Some(i)) = (&self.proc, self.sel) {
+            if let Some(pl) = self.list.get(i) {
+                self.cur = Player::load(p, pl.addr);
+                // 每幀呼叫 growth_struct_for 會一直 ReadProcessMemory, 在這裡算一次就好
+                self.growth_base = growth_struct_for(p, pl.addr);
+            }
+        }
+    }
+
+    /// 把目前載入的選手身上的原創球種記錄併進球種庫並存檔。
+    ///
+    /// 發布的 `origlib.json` 只附官方球種（人人都有），自訂球種是各人存檔獨有的，
+    /// 靠這個從自己的遊戲裡補進來。
+    fn collect_lib(&mut self) {
+        let mut n = merge_recs_into_lib(&mut self.lib, &self.list);
+        if let Some(c) = self.cur.clone() {
+            n += merge_recs_into_lib(&mut self.lib, std::slice::from_ref(&c));
+        }
+        let dst = origlib_save_path();
+        // 非全掃模式的清單只有少數選手，蒐集不完 —— 收完再提醒一次
+        let more = if self.mode == Mode::Scan {
+            String::new()
+        } else {
+            "　※ 切到「明星選手(全掃)」再按一次可以蒐集到更多".into()
+        };
+        self.status = match save_lib(&dst, &self.lib) {
+            Ok(()) if n == 0 => format!(
+                "球種庫沒有新增（這些球種都已經在庫裡了）—— 目前共 {} 筆{more}",
+                self.lib.len()
+            ),
+            Ok(()) => format!(
+                "✓ 球種庫新增 {n} 筆，目前共 {} 筆 → {}{more}",
+                self.lib.len(),
+                dst.display()
+            ),
+            Err(e) => e,
+        };
+    }
+
+    fn write_ok(&mut self, ok: bool, what: &str) {
+        self.status = if ok {
+            format!("已寫入 {what}　※切到別的選手再切回來畫面才會重畫")
+        } else {
+            format!("✗ 寫入失敗：{what}（位址可能已失效，按「重新整理」）")
+        };
+    }
+}
+
+/// 把第 n 個 nibble 寫回本地快照（記憶體那邊由 write_abil_nibble 負責）
+fn set_nib(b: &mut [u8], n: usize, v: u8) {
+    let i = n / 2;
+    b[i] = if n % 2 == 0 { (b[i] & 0xF0) | (v & 0xF) } else { (b[i] & 0x0F) | (v << 4) };
+}
+
+/// 清單裡的一列：守備位置圖標 ＋ 姓名。回傳 true 表示被點選。
+/// 整列都是點擊區（名字的 SelectableLabel 撐滿剩餘寬度）。
+fn player_row(ui: &mut egui::Ui, pl: &Player, sel: bool, copies: usize, star: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [30.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
+            ),
+        );
+        let mut txt = if star { format!("★ {}", pl.name) } else { pl.name.clone() };
+        if copies > 1 {
+            txt.push_str(&format!("　×{copies}"));
+        }
+        let w = ui.available_width().max(40.0);
+        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, txt))
+            .on_hover_text(if star {
+                format!("物件 {:#x}\n★ 這份帶成長經驗值結構 ＝ 明星選手的主角，編輯要用這份", pl.addr)
+            } else {
+                format!("物件 {:#x}", pl.addr)
+            })
+            .clicked()
+    })
+    .inner
+}
+
+/// G~S 由低到高（`grade_btn` 的選項表）
+const GS_OPTS: [(u8, &str); 8] = [
+    (0, "G"), (1, "F"), (2, "E"), (3, "D"), (4, "C"), (5, "B"), (6, "A"), (7, "S"),
+];
+
+/// 等級字母的底色，比照遊戲畫面
+fn grade_color(t: &str) -> egui::Color32 {
+    match t {
+        "S" => egui::Color32::from_rgb(238, 238, 238),
+        "A" => egui::Color32::from_rgb(246, 168, 208),
+        "B" => egui::Color32::from_rgb(240, 112, 112),
+        "C" => egui::Color32::from_rgb(246, 160, 62),
+        "D" => egui::Color32::from_rgb(240, 205, 72),
+        "E" => egui::Color32::from_rgb(182, 220, 92),
+        "F" => egui::Color32::from_rgb(122, 190, 240),
+        "G" => egui::Color32::from_rgb(184, 162, 212),
+        _ => egui::Color32::from_gray(90),
+    }
+}
+
+/// 等級（或任何有序選項）的共用控制項：**左鍵 +1、超過最高繞回最低**，右鍵開選單。
+/// `opts` 由低到高排列。回傳 `Some(新值)` 表示有變動。
+fn grade_btn(ui: &mut egui::Ui, v: u8, opts: &[(u8, &str)], w: f32) -> Option<u8> {
+    let i = opts.iter().position(|&(x, _)| x == v);
+    let txt = i.map(|k| opts[k].1).unwrap_or("?");
+    let mut out = None;
+    let resp = ui
+        .add_sized(
+            [w, 22.0],
+            egui::Button::new(
+                egui::RichText::new(txt).strong().color(egui::Color32::from_gray(20)),
+            )
+            .fill(grade_color(txt)),
+        )
+        .on_hover_text("左鍵：往上一級（超過最高會繞回最低）\n右鍵：直接選");
+    if resp.clicked() {
+        let k = i.map_or(0, |k| (k + 1) % opts.len());
+        out = Some(opts[k].0);
+    }
+    resp.context_menu(|ui| {
+        for &(val, t) in opts.iter().rev() {
+            if ui.selectable_label(val == v, t).clicked() {
+                out = Some(val);
+                ui.close_menu();
+            }
+        }
+    });
+    out
+}
+
+/// 九宮格單格：**左鍵 +1、超過 +3 繞回 −3**，右鍵開選單。正紅負藍，比照遊戲。
+fn zone_btn(ui: &mut egui::Ui, v: i8) -> Option<i8> {
+    let (fill, fg) = if v > 0 {
+        (egui::Color32::from_rgb(170, 38, 38), egui::Color32::WHITE)
+    } else if v < 0 {
+        (egui::Color32::from_rgb(38, 68, 176), egui::Color32::WHITE)
+    } else {
+        (egui::Color32::from_gray(48), egui::Color32::from_gray(190))
+    };
+    let txt = if v > 0 {
+        format!("▲{v}")
+    } else if v < 0 {
+        format!("▼{}", -v)
+    } else {
+        "0".to_string()
+    };
+    let mut out = None;
+    let resp = ui
+        .add_sized(
+            [54.0, 30.0],
+            egui::Button::new(egui::RichText::new(txt).strong().color(fg)).fill(fill),
+        )
+        .on_hover_text("左鍵：+1（超過 +3 會繞回 −3）\n右鍵：直接選");
+    if resp.clicked() {
+        out = Some(if v >= 3 { -3 } else { v + 1 });
+    }
+    resp.context_menu(|ui| {
+        for x in (-3i8..=3).rev() {
+            let t = if x > 0 { format!("+{x}") } else { x.to_string() };
+            if ui.selectable_label(v == x, t).clicked() {
+                out = Some(x);
+                ui.close_menu();
+            }
+        }
+    });
+    out
+}
+
+/// 守備位置圖標的顏色，比照遊戲畫面：投手紅／捕手藍紫／內野黃／外野綠
+fn pos_color(v: u8) -> egui::Color32 {
+    match v {
+        0 => egui::Color32::from_rgb(235, 120, 120),
+        1 => egui::Color32::from_rgb(150, 160, 235),
+        2..=5 => egui::Color32::from_rgb(225, 190, 90),
+        6..=8 => egui::Color32::from_rgb(120, 210, 130),
+        _ => egui::Color32::GRAY,
+    }
+}
+
+fn grade_of(v: u8) -> &'static str {
+    match v {
+        0..=19 => "G",
+        20..=29 => "F",
+        30..=39 => "E",
+        40..=54 => "D",
+        55..=69 => "C",
+        70..=79 => "B",
+        80..=89 => "A",
+        _ => "S",
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
+        self.poll_scan(ctx);
+
+        egui::TopBottomPanel::top("top").show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("prospi 選手編輯器");
+                ui.separator();
+                // 先取值再畫，避免 &self.proc 的借用跟 self 的 &mut 方法打架
+                let alive = self.proc_alive();
+                let pid = self.proc.as_ref().map(|p| p.pid);
+                match pid {
+                    Some(id) if alive => {
+                        ui.colored_label(egui::Color32::from_rgb(80, 200, 120),
+                                         format!("已附加 pid {id}"));
+                    }
+                    Some(id) => {
+                        ui.colored_label(egui::Color32::from_rgb(240, 170, 60),
+                                         format!("pid {id} 已失效 —— 遊戲重開過了，按「重新附加」"));
+                    }
+                    None => {
+                        ui.colored_label(egui::Color32::from_rgb(230, 100, 100), &self.err);
+                    }
+                }
+                // ⚠ 一律顯示，不能只在完全沒附加時才給 —— 遊戲重開後 self.proc 仍是 Some
+                //   （只是 handle 指向死掉的 pid），使用者會找不到重新附加的入口。
+                if ui.button("重新附加").clicked() {
+                    self.proc = None;
+                    self.item_patch_scanned = false; // 遊戲重開後程式碼位址會變, 快取作廢
+                    self.growth_base = None;
+                    self.reload_list();
+                }
+                ui.separator();
+                let mut m = self.mode;
+                ui.selectable_value(&mut m, Mode::Koshien, "栄冠(高中)");
+                ui.selectable_value(&mut m, Mode::Star, "明星選手(主角)")
+                    .on_hover_text("只找主角 —— 用成長經驗值結構的門檻表定位, 約 5 秒。\n\
+                                    找不到就退回全記憶體掃描。");
+                ui.selectable_value(&mut m, Mode::Scan, "明星選手(全掃)");
+                if m != self.mode {
+                    self.mode = m;
+                    self.reload_list();
+                }
+                if ui.button("重新整理").clicked() {
+                    self.reload_list();
+                }
+            });
+
+            // ── 球種庫：跟選中哪位選手無關，所以放在頂端一直可見
+            //    （原本放在選手資訊頁的收合區裡，沒選到選手就完全看不到）
+            ui.horizontal(|ui| {
+                let empty = self.lib.is_empty();
+                let btn = egui::Button::new(
+                    egui::RichText::new("⟳  蒐集原創球種到球種庫").strong(),
+                )
+                .fill(if empty {
+                    egui::Color32::from_rgb(150, 100, 30)
+                } else {
+                    egui::Color32::from_rgb(52, 110, 72)
+                });
+                if ui
+                    .add_sized([220.0, 26.0], btn)
+                    .on_hover_text(
+                        "把目前清單裡的選手身上的原創球種記錄加進球種庫並存檔。\n\
+                         內附的球種庫只有官方球種；你自己用遊戲內編輯器做的球種\n\
+                         要按這裡才會進到庫裡，之後就能套用到任何選手身上。\n\n\
+                         依名稱去重，已經有的不會重複加。\n\
+                         蒐集到多少取決於當下載入了哪些選手 ——\n\
+                         想一次蒐集最多，先切到「明星選手(全掃)」再按。",
+                    )
+                    .clicked()
+                {
+                    self.collect_lib();
+                }
+                let n_custom = self.lib.iter().filter(|e| e.kind == "自訂").count();
+                if empty {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 190, 100),
+                        format!("球種庫是空的（找過 {}）—— 按左邊可以從遊戲裡重建",
+                                self.libpath.display()),
+                    );
+                } else {
+                    ui.label(format!("球種庫 {} 筆（官方 {}／自訂 {}）",
+                                     self.lib.len(), self.lib.len() - n_custom, n_custom));
+                    ui.weak(format!("來源：清單 {} 位選手", self.list.len()));
+                }
+                // 蒐集得到多少完全看當下清單有誰 —— 其他模式的清單小很多,
+                // 所以直接把「先切到全掃」講在畫面上, 不要只寫在 hover 裡。
+                if self.mode != Mode::Scan {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 190, 100),
+                        "※ 建議先切到「明星選手(全掃)」再按，蒐集得到的球種最多",
+                    );
+                }
+            });
+            if self.scan_rx.is_some() {
+                let (d, t) = self.scan_prog;
+                ui.add(egui::ProgressBar::new(d as f32 / t as f32)
+                    .text(format!("掃描中 {d}/{t} MB")));
+            }
+            if !self.status.is_empty() {
+                ui.label(&self.status);
+            }
+        });
+
+        // 常規功能：不依賴選中的選手，所以獨立成底部面板一直可見
+        egui::TopBottomPanel::bottom("cheats").show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("常規功能").strong());
+                if self.cheats.any_on() {
+                    let t = self.cheats.ticks.load(Ordering::Relaxed);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 200, 120),
+                        egui::RichText::new(format!("持續套用中（每 0.3 秒重寫．已 {t} 輪）")).small());
+                    // 沒有這行的話視窗失焦就不重繪，心跳會看起來卡住（實際上執行緒還在跑）
+                    ctx.request_repaint_after(std::time::Duration::from_millis(500));
+                } else {
+                    ui.label(egui::RichText::new("勾了就持續生效，不必再按任何按鈕")
+                        .weak().small());
+                }
+            });
+            ui.horizontal_wrapped(|ui| {
+                cheat_box(ui, &self.cheats.koshien_items,
+                    "栄冠：全道具 99 ＋ 使用不消耗",
+                    "221 格道具全部寫 99 並持續維持。\n\
+                     每 0.3 秒就補回去，所以用掉也會立刻回滿 ＝ 等同不消耗，\
+                     不必像 CT 那樣去 hook 扣除的那行程式碼。\n\
+                     ⚠ 要在有部員名單的畫面才有效（離開栄冠模式時指標鏈會變 0）。");
+                cheat_box(ui, &self.cheats.koshien_limit,
+                    "栄冠：解除「每人 1 個道具 / 書籍 5 本」",
+                    "把每位部員的 +0x1511 / +0x1512 持續歸零 —— 上限判斷讀的就是這兩個 byte。");
+                cheat_box(ui, &self.cheats.koshien_prac,
+                    "栄冠：練習效果提升永久",
+                    "把「練習效果提升中」的剩餘天數持續寫回 9999（道具物件 +0x382，i16）。\n\
+                     畫面顯示夾在 99，但內部真的是 9999、照常每天 −1。\n\
+                     ⚠ 觸發經理事件時遊戲會把這個值夾回 99，所以才需要持續維持；\
+                     若你不會再觸發，用右邊的按鈕寫一次就夠（9999 天 ≈ 27 遊戲年）。\n\
+                     ⚠ 要在栄冠模式（有部員名單的畫面）才有效。");
+                cheat_box(ui, &self.cheats.shared_items,
+                    "跨模式：共用道具全 99",
+                    "exe+1974D280 的 i32×49，含栄冠 UI 最後 11 格與明星選手的 7 種。\n\
+                     這是靜態位址，跨版本沒變過，任何模式都能寫。");
+                // ⚠ 這個不是「持續重寫」而是 code patch —— 按一次就永久生效（直到遊戲重開）,
+                //   所以做成按鈕而不是勾選框。舊版走 clear_star_item_uses（靜態指標）已失效。
+                {
+                    // ⚠ AOB 掃 869MB —— 只在第一次（或按過按鈕後）掃, 之後讀快取位址的 2 bytes
+                    if !self.item_patch_scanned {
+                        self.item_patch_addr =
+                            self.proc.as_ref().and_then(|p| find_code(p, ITEM_INC_AOB));
+                        self.item_patch_scanned = true;
+                    }
+                    let patched = match (self.proc.as_ref(), self.item_patch_addr) {
+                        (Some(p), Some(a)) => p.read(a, 2).map(|b| b == [0x90, 0x90]),
+                        _ => None,
+                    };
+                    let label = match patched {
+                        Some(true) => "明星選手：道具使用不消耗　✔ 生效中",
+                        Some(false) => "明星選手：道具使用不消耗",
+                        None => "明星選手：道具使用不消耗（找不到指令）",
+                    };
+                    if ui.button(label)
+                        .on_hover_text(
+                            "把 exe+5B957A1 的 `inc al` nop 掉 —— 使用次數永遠停在 0,\n\
+                             所以用了道具也不會變成 1/10。\n\
+                             ⚠ 這是 code patch, 按一次就好, 不必持續套用;\n\
+                             　 遊戲重開後會消失, 要再按一次。\n\
+                             ⚠ 這條是通用計數器（index 夾 0..271）, nop 掉會讓\n\
+                             　 所有走這條路的計數都不增加, 不只道具。再按一次可還原。")
+                        .clicked()
+                    {
+                        let on = patched != Some(true);
+                        let ok = match (self.proc.as_ref(), self.item_patch_addr) {
+                            (Some(p), Some(a)) => {
+                                p.write_code(a, if on { &[0x90, 0x90] } else { &[0xFE, 0xC0] })
+                            }
+                            _ => false,
+                        };
+                        self.status = format!("道具使用不消耗 → {}：{}",
+                                              if on { "開" } else { "還原" },
+                                              if ok { "ok" } else { "失敗" });
+                    }
+                }
+            });
+            // 值本身一天才減 1，不勾也行 —— 但觸發經理事件時遊戲會夾回 99，
+            // 所以「按一次」只適合之後不再觸發的情況，兩種都留給使用者選。
+            ui.horizontal_wrapped(|ui| {
+                if ui.button("栄冠：練習效果提升 → 9999 天（單次）")
+                    .on_hover_text(
+                        "把「練習效果提升中」的剩餘天數寫成 9999（道具物件 +0x382，i16）。\n\
+                         畫面顯示夾在 99，但內部真的是 9999、照常每天 −1 —— \
+                         9999 遊戲天 ≈ 27 年，一場栄冠才 3 年。\n\
+                         ⚠ 之後只要再觸發經理事件，遊戲就會把它夾回 99，\
+                         那種情況請改勾左邊的「練習效果提升永久」。\n\
+                         ⚠ 要在栄冠模式（有部員名單的畫面）才有效。\n\
+                         ⚠ 記憶體修改不進存檔，重讀存檔後要再按一次。")
+                    .clicked()
+                {
+                    if self.ensure_proc() {
+                        let done = self.proc.as_ref()
+                            .is_some_and(|p| set_koshien_pracbuff(p, KOSHIEN_PRACBUFF_DAYS));
+                        self.status = if done {
+                            format!("已把練習效果提升設成 {KOSHIEN_PRACBUFF_DAYS} 天（畫面會顯示 99）")
+                        } else {
+                            "寫入失敗 —— 目前不在栄冠模式（指標鏈是 0），\
+                             請在有部員名單的畫面再按一次".into()
+                        };
+                    }
+                }
+            });
+            ui.add_space(3.0);
+        });
+
+        egui::SidePanel::left("list").resizable(true).default_width(230.0).show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("搜尋");
+                ui.text_edit_singleline(&mut self.filter);
+            });
+            // ⚠ 原本是「球速≥120」—— 但野手的球速欄一律是 120，等於完全沒過濾。
+            //   改用 +0xEB6 的守備位置。
+            ui.checkbox(&mut self.only_pitchers, "只顯示投手");
+            ui.checkbox(&mut self.merge_dups, "合併同名副本")
+                .on_hover_text("同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。\n勾起來時同隊同名只留位址最小的那份，右邊會標「×份數」。\n⚠ 挑哪一份是經驗法則（12 位對照畫面值中 11 位正確），\n　 改了畫面沒反應就取消勾選、換一份試。");
+            ui.separator();
+            // auto_shrink=false：否則每列是 horizontal（內容寬），ScrollArea 會跟著縮，
+            // 面板右半邊會空一大塊出來
+            egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                let f = self.filter.trim().to_lowercase();
+                let mut newsel = None;
+
+                // 依守備位置分組（P→C→1B→2B→3B→SS→LF→CF→RF），組內能力高的在前
+                // —— 跟遊戲的部員一覽同一個排法，方便對著畫面找人。
+                // ⚠ 只排「顯示順序」，self.list 不動，否則 self.sel 這個索引會失效。
+                let mut order: Vec<usize> = (0..self.list.len())
+                    .filter(|&i| {
+                        let pl = &self.list[i];
+                        (f.is_empty() || pl.name.to_lowercase().contains(&f))
+                            && !(self.only_pitchers && pl.pos != 0)
+                    })
+                    .collect();
+                order.sort_by_key(|&i| {
+                    let pl = &self.list[i];
+                    // 投手看球速、野手看對右打擊 —— 只在組內比較, 混用不影響
+                    let strength = if pl.pos == 0 { pl.speed as i32 } else { pl.stats[0] as i32 };
+                    (pl.pos, -strength)
+                });
+
+                // ── 合併同名副本：同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。
+                //   同隊同名只留**位址最小**的那份 —— 拿 12 位選手的畫面球速/耐力比對，
+                //   這條規則 11/12 挑到畫面正在讀的那份。
+                // 查 reload 時算好的表, 每幀不做任何記憶體讀取
+                let mut copies: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                if self.merge_dups {
+                    order.retain(|&i| {
+                        let pl = &self.list[i];
+                        match self.dup_rep.get(&(pl.team, pl.name.clone())) {
+                            Some(&(rep, n)) if rep == i => {
+                                copies.insert(i, n);
+                                true
+                            }
+                            Some(_) => false,
+                            None => true,
+                        }
+                    });
+                }
+
+                if self.mode == Mode::Koshien {
+                    // 栄冠只有一隊 —— 直接照守備位置分組
+                    let mut last_pos: Option<u8> = None;
+                    for i in order {
+                        if last_pos.is_some_and(|p| p != self.list[i].pos) {
+                            ui.separator();
+                        }
+                        last_pos = Some(self.list[i].pos);
+                        if player_row(ui, &self.list[i], self.sel == Some(i),
+                                      copies.get(&i).copied().unwrap_or(1),
+                                      self.growth_owners.contains(&i)) {
+                            newsel = Some(i);
+                        }
+                    }
+                } else {
+                    // 明星選手：先分隊，隊內再照守備位置（order 已經排好，這裡保持穩定）
+                    let mut by_team: std::collections::BTreeMap<u8, Vec<usize>> =
+                        std::collections::BTreeMap::new();
+                    for &i in &order {
+                        by_team.entry(self.list[i].team).or_default().push(i);
+                    }
+                    for (tid, idxs) in by_team {
+                        // 沒自訂隊名時，把隊上第一位（排序後＝最強的投手）當辨識線索，
+                        // 不然一整排「隊伍 6」根本認不出誰是誰
+                        let label = match self.teams.get(&tid) {
+                            Some(n) => format!("{n}　{} 人", idxs.len()),
+                            None => format!(
+                                "隊伍 {tid}　{} 人　（{}…）",
+                                idxs.len(),
+                                self.list[idxs[0]].name
+                            ),
+                        };
+                        let mut head =
+                            egui::CollapsingHeader::new(label).id_source(("team", tid));
+                        // 搜尋中就全部展開，否則搜到的人會藏在收合的群組裡
+                        if !f.is_empty() {
+                            head = head.open(Some(true));
+                        }
+                        head.show(ui, |ui| {
+                            // 隊名：記憶體裡沒有 ID→隊名的對照表, 讓使用者自己命名並存檔
+                            if self.rename_team == Some(tid) {
+                                let r = ui.text_edit_singleline(&mut self.rename_buf);
+                                let done = r.lost_focus()
+                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                if done || ui.small_button("✔ 儲存").clicked() {
+                                    let v = self.rename_buf.trim().to_string();
+                                    if v.is_empty() {
+                                        self.teams.remove(&tid);
+                                    } else {
+                                        self.teams.insert(tid, v);
+                                    }
+                                    self.rename_team = None;
+                                    self.status = match save_teams(&teams_path(), &self.teams) {
+                                        Ok(()) => format!("已存隊名 → {}", teams_path().display()),
+                                        Err(e) => e,
+                                    };
+                                }
+                            } else {
+                                let hint = &self.list[idxs[0]].name;
+                                if ui
+                                    .small_button(format!("✎ 命名（例如：{hint} 那一隊）"))
+                                    .on_hover_text(
+                                        "遊戲記憶體裡沒有隊伍 ID 對隊名的表, \
+                                         所以隊名要自己填一次, 之後會記在 teams.json。",
+                                    )
+                                    .clicked()
+                                {
+                                    self.rename_team = Some(tid);
+                                    self.rename_buf =
+                                        self.teams.get(&tid).cloned().unwrap_or_default();
+                                }
+                            }
+                            for &i in &idxs {
+                                if player_row(ui, &self.list[i], self.sel == Some(i),
+                                      copies.get(&i).copied().unwrap_or(1),
+                                      self.growth_owners.contains(&i)) {
+                                    newsel = Some(i);
+                                }
+                            }
+                        });
+                    }
+                }
+                if let Some(i) = newsel {
+                    self.sel = Some(i);
+                    self.reload_current();
+                }
+            });
+        });
+
+        egui::CentralPanel::default().show(ctx, |ui| {
+            if self.cur.is_none() {
+                ui.centered_and_justified(|ui| ui.label("← 從左邊選一位選手"));
+                return;
+            }
+            egui::ScrollArea::vertical().show(ui, |ui| self.editor(ui));
+        });
+    }
+}
+
+impl App {
+    fn editor(&mut self, ui: &mut egui::Ui) {
+        let mut cur = self.cur.clone().unwrap();
+        let obj = cur.addr;
+        let mut act: Option<(bool, String)> = None;
+        // ⚠ cur 是進來時的快照。只要動到「原創球種記錄陣列」或球種 ID，
+        //   就必須從記憶體重讀 —— 否則「找一筆空記錄」會一直回傳同一個索引，
+        //   連續設定多個方向的原創球種時會全部蓋在同一筆上（只有最後一顆會生效）。
+        let mut need_reload = false;
+        // 這位選手的所有副本（同隊同名），依位址排序 —— 給標題列的 ◀ ▶ 用
+        let mut switch: Option<usize> = None;
+        let sibs: Vec<usize> = {
+            let mut v: Vec<usize> = (0..self.list.len())
+                .filter(|&i| self.list[i].team == cur.team && self.list[i].name == cur.name)
+                .collect();
+            v.sort_by_key(|&i| self.list[i].addr);
+            v
+        };
+
+        macro_rules! P {
+            () => {
+                match &self.proc { Some(p) => p, None => return }
+            };
+        }
+
+        ui.horizontal(|ui| {
+            ui.heading(&cur.name);
+            ui.colored_label(pos_color(cur.pos), egui::RichText::new(pos_name(cur.pos)).strong());
+            if self.mode != Mode::Koshien {
+                let t = self
+                    .teams
+                    .get(&cur.team)
+                    .cloned()
+                    .unwrap_or_else(|| format!("隊伍 {}", cur.team));
+                ui.label(t);
+            }
+            ui.label(format!("物件 {obj:#x}"));
+            if ui.button("重新讀取").clicked() {
+                act = Some((true, "（重新讀取）".into()));
+            }
+
+            // ── 副本切換。「合併同名副本」是幫你挑了一份（同隊同名取位址最小），
+            //    實測 12 位對照畫面值中 11 位正確 —— 挑錯時症狀是「改了畫面沒反應」，
+            //    所以一定要留一個當場換一份的入口。
+            if sibs.len() > 1 {
+                ui.separator();
+                let k = sibs.iter().position(|&i| Some(i) == self.sel).unwrap_or(0);
+                if ui.small_button("◀").clicked() {
+                    switch = Some(sibs[(k + sibs.len() - 1) % sibs.len()]);
+                }
+                ui.label(
+                    egui::RichText::new(format!("副本 {}/{}", k + 1, sibs.len()))
+                        .color(egui::Color32::from_rgb(240, 190, 100)),
+                )
+                .on_hover_text(
+                    "這位選手在記憶體裡有多份。清單顯示的是位址最小的那一份，\n\
+                     但不保證就是遊戲正在讀的那份。\n\
+                     改了畫面沒反應 → 按 ◀ ▶ 換一份再改。",
+                );
+                if ui.small_button("▶").clicked() {
+                    switch = Some(sibs[(k + 1) % sibs.len()]);
+                }
+            }
+        });
+        ui.separator();
+
+        // 位址可能已經不屬於這位選手：遊戲重開，或明星選手模式讀了存檔後物件整批搬家。
+        // 讀回姓名比對，對不上就整個停用 —— 否則接下來每個滑桿都會寫進別人的資料。
+        let live = self.proc.as_ref().map(|p| read_name(p, obj)).unwrap_or_default();
+        if live != cur.name || !sane_name(&live) {
+            let shown = if live.trim().is_empty() { "（空白）" } else { live.as_str() };
+            ui.colored_label(
+                egui::Color32::from_rgb(240, 170, 60),
+                format!("⚠ 這個位址現在讀到「{shown}」，不是 {} —— 遊戲重開或讀過存檔了。\n\
+                         栄冠：按上方「重新整理」即可。明星選手：要重新掃描一次。",
+                        cur.name));
+            return;
+        }
+
+        // ── 鎖定（明星選手模式的成長結算會把能力值算回原值）
+        ui.horizontal_wrapped(|ui| {
+            let mut on = self.cheats.lock_player.load(Ordering::Relaxed);
+            let changed = ui
+                .checkbox(&mut on, "🔒 鎖定這位選手的數值（每 0.3 秒重寫）")
+                .on_hover_text(
+                    "明星選手模式的能力值有一份權威來源（成長／經驗值資料），\
+                     我們改的只是它算出來的結果。\n\
+                     打完比賽或推進日期時遊戲會重新結算並覆寫，還會報「力量已下降 23 了！」\
+                     —— 所以單次寫入撐不到下一場。\n\
+                     勾這個就每 0.3 秒把值重寫回去，遊戲蓋回來也會立刻被蓋回去。\n\
+                     ⚠ 結算畫面仍會顯示「已下降 N」（那是遊戲自己比對快照），\
+                     但過完那個畫面數值就會回到你設定的值。\n\
+                     ⚠ 鎖定的是「勾選當下這一位」，之後切換選手不會跟著換；\
+                     要改鎖別人請取消再重新勾。\n\
+                     ⚠ 記憶體修改不進存檔，讀過存檔後物件會整批搬家 —— \
+                     那時要重新掃描並重新勾一次。")
+                .changed();
+            if changed {
+                self.cheats.lock_player.store(on, Ordering::Relaxed);
+                if let Ok(mut g) = self.cheats.lock.lock() {
+                    *g = if on { Some(LockTarget::of(&cur)) } else { None };
+                }
+                self.cheats.lock_stale.store(false, Ordering::Relaxed);
+            }
+            if on {
+                let mut bb = self.cheats.lock_balls.load(Ordering::Relaxed);
+                if ui
+                    .checkbox(&mut bb, "連球種一起鎖")
+                    .on_hover_text(
+                        "預設不鎖球種 —— 否則你在遊戲內學到的新球種也會被蓋掉。\n\
+                         球種也被結算改掉時才勾。")
+                    .changed()
+                {
+                    self.cheats.lock_balls.store(bb, Ordering::Relaxed);
+                }
+                // 只有「目前選中的就是鎖定目標」時才同步，
+                // 否則切去看別人時會把鎖定目標搶走。
+                let mut locked_name = None;
+                if let Ok(mut g) = self.cheats.lock.lock() {
+                    match g.as_ref() {
+                        Some(t) if t.addr == obj => *g = Some(LockTarget::of(&cur)),
+                        Some(t) => locked_name = Some(t.name.clone()),
+                        None => *g = Some(LockTarget::of(&cur)),
+                    }
+                }
+                if let Some(nm) = locked_name {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(240, 170, 60),
+                        format!("⚠ 目前鎖定的是「{nm}」，不是這一位"));
+                } else if self.cheats.lock_stale.load(Ordering::Relaxed) {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 100, 100),
+                        "⚠ 位址已失效（讀過存檔？）—— 請重新掃描後再勾一次");
+                } else {
+                    let t = self.cheats.ticks.load(Ordering::Relaxed);
+                    ui.colored_label(
+                        egui::Color32::from_rgb(80, 200, 120),
+                        format!("鎖定中（已 {t} 輪）"));
+                }
+            }
+        });
+        ui.separator();
+
+        // ── 成長經驗值（★ 明星選手模式的能力值真正來源）
+        // 只有找得到經驗值結構時才顯示 —— 栄冠模式沒有這東西
+        let growth = self.growth_base.filter(|_| self.cur.as_ref().is_some_and(|c| c.addr == obj));
+        if let Some(gb) = growth {
+            egui::CollapsingHeader::new("★ 成長經驗值（明星選手要改這裡）")
+                .default_open(true)
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(
+                            "明星選手模式的能力值是「由累積經驗值算出來的衍生值」。\n\
+                             直接拉下面的能力滑桿, 打完比賽或推進日期就會被結算重算回去\
+                             （畫面還會顯示「力量已下降 N 了！」）。\n\
+                             灌經驗值走的是遊戲自己的成長管線 —— 結算會算出 99 而不是改回去, \
+                             報告畫面顯示的是「上升」。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                    let exp = self.proc.as_ref().map(|p| growth_exp(p, gb)).unwrap_or_default();
+                    egui::Grid::new("growth").num_columns(4).spacing([14.0, 3.0]).show(ui, |ui| {
+                        for (i, v) in exp.iter().enumerate() {
+                            let full = *v >= GROWTH_EXP_MAX;
+                            // 附上換算後的能力值, 才看得懂這個經驗值代表什麼
+                            let t = if i == EXP_IDX_SPEED {
+                                format!("{}　{}", GROWTH_EXP_NAMES[i], v) // 球速走另一套換算
+                            } else {
+                                format!("{}　{} → {}", GROWTH_EXP_NAMES[i], v, stat_for_exp(*v))
+                            };
+                            if full {
+                                ui.colored_label(egui::Color32::from_rgb(80, 200, 120), t);
+                            } else {
+                                ui.label(t);
+                            }
+                            if i % 4 == 3 {
+                                ui.end_row();
+                            }
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("目標能力值");
+                        ui.add(egui::Slider::new(&mut self.growth_target, 0..=99));
+                        let e = exp_for_stat(self.growth_target);
+                        ui.label(
+                            egui::RichText::new(format!("＝ 經驗值 {e}（回推 {}）",
+                                                        stat_for_exp(e)))
+                                .small().weak(),
+                        );
+                        if ui
+                            .button("套用")
+                            .on_hover_text(
+                                "把 8 項能力／投手適性／8 個野手守位的經驗值\
+                                 都設成「剛好算出這個能力值」的量。\n\
+                                 公式 exp = 門檻[L] + (目標 − 基礎[L]) * 分母[L],\
+                                 由 exe+62A7A30 反解得出。\n\
+                                 ⚠ 球速/耐力那格走另一套換算, 一律灌到上限（→175km/h）。",
+                            )
+                            .clicked()
+                        {
+                            let t = self.growth_target;
+                            let ok = self.proc.as_ref()
+                                .is_some_and(|p| set_growth_target(p, gb, t));
+                            act = Some((ok, format!("成長經驗值 → 目標 {t}")));
+                        }
+                    });
+                    if ui
+                        .button(format!("★ 全部灌到 {GROWTH_EXP_MAX} → 下次結算後能力全 99"))
+                        .on_hover_text(
+                            "寫進 10 格經驗值。⚠ 要「打一場比賽或推進日期」讓結算跑過, \
+                             能力值才會變 —— 光切換畫面不會重算。\n\
+                             實測結果: 球速 159→175km/h、耐力 75→99、其餘 7 項與投手守備適性全 99。\n\
+                             ⚠ 記憶體修改不進存檔, 重開遊戲要重來一次。",
+                        )
+                        .clicked()
+                    {
+                        let ok = self
+                            .proc
+                            .as_ref()
+                            .is_some_and(|p| set_growth_exp(p, gb, GROWTH_EXP_MAX));
+                        act = Some((ok, "成長經驗值（推進一天後能力才會變）".into()));
+                    }
+                    if ui
+                        .button("＋ 連球種數值與各守位適性一起拉")
+                        .on_hover_text(
+                            "8 個野手守位一律灌滿（+0x68+i*4 → 72600）—— 不灌的話, \
+                             你在遊戲內練哪個守位, 哪個就會被算回 G。\n\
+                             球種的球威/控球/變化幅度也走同一套經驗值。\n\
+                             ⚠ 只提升「本來就非零」的格 —— 值為 0 代表**該項目不存在**\
+                             （沒學會的球種、不能守的守位）, 灌下去遊戲會當掉。\n\
+                             所以新學一顆球之後要先讓它出現非零經驗值, 這個按鈕才拉得動它。",
+                        )
+                        .clicked()
+                    {
+                        let (f, n) = self
+                            .proc
+                            .as_ref()
+                            .map(|p| (set_field_exp(p, gb), raise_growth_extra(p, gb)))
+                            .unwrap_or((false, 0));
+                        act = Some((
+                            f || n > 0,
+                            format!("守位經驗值 {}／球種經驗值 {n} 格",
+                                    if f { "8 格" } else { "失敗" }),
+                        ));
+                    }
+                    if ui
+                        .button("⚡ 立即套用結果（不用等練習）")
+                        .on_hover_text(
+                            "把「經驗值滿了之後會算出來的結果」直接寫進選手物件：\n\
+                             8 項能力 99、球速 175、耐力 99、守備適性全 99。\n\
+                             這樣不必等結算跑過就看得到 —— 球種當初能「連練習都不用」\
+                             就是因為同時寫了顯示值與經驗值, 這裡把能力值也補上同一半。\n\
+                             ⚠ 要先按上面的按鈕灌經驗值, 否則下次結算又會被算回原值。",
+                        )
+                        .clicked()
+                    {
+                        let ok = self.proc.as_ref().is_some_and(|p| apply_growth_result(p, obj));
+                        act = Some((ok, "立即套用（能力 99／球速 175／耐力 99）".into()));
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "結構 {gb:#x}　＝　選手物件 +0x{GROWTH_FROM_PLAYER:X}",
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                });
+            ui.separator();
+        }
+
+        // ── 基本
+        egui::CollapsingHeader::new("基本").default_open(true).show(ui, |ui| {
+            egui::Grid::new("basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("球速 km/h")
+                    .on_hover_text("球速有自己的換算表（基礎158/門檻結構+0x158/分母9000…）,\n\
+                                    拉滑桿會同步寫經驗值, 練習不會回退。\n\
+                                    ⚠ 上限就是遊戲的 175 —— 實測 patch 掉程式碼上限後\n\
+                                    　 資料上顯示 207, 但實戰投出來仍然是 175, 沒有意義。");
+                if ui.add(egui::Slider::new(&mut cur.speed, 80..=SPEED_UI_MAX)).changed() {
+                    let ok = write_pack_synced(P!(), obj, cur.speed, cur.stamina, cur.pack_hi);
+                    act = Some((ok, "球速（含經驗值）".into()));
+                }
+                ui.end_row();
+
+                ui.label("耐力")
+                    .on_hover_text("耐力有自己的經驗值格（+0x60）, 跟能力值同一組換算表,\n\
+                                    所以拉這個滑桿**會**同步寫經驗值, 練習不會回退。");
+                if ui.add(egui::Slider::new(&mut cur.stamina, 0..=99)).changed() {
+                    let ok = write_pack_synced(P!(), obj, cur.speed, cur.stamina, cur.pack_hi);
+                    act = Some((ok, "耐力（含經驗值）".into()));
+                }
+                ui.end_row();
+
+                ui.label("投手適性");
+                if ui.add(egui::Slider::new(&mut cur.defense, 0..=99)).changed() {
+                    let ok = write_def_synced(P!(), obj, cur.defense);
+                    act = Some((ok, "投手適性（含經驗值）".into()));
+                }
+                ui.end_row();
+
+                // 8 個野手守位（+0x18..0x1F）。⚠ 只寫顯示值撐不住 ——
+                // 沒練的守位看起來正常, 一旦在遊戲內練它就會依經驗值被算回 G,
+                // 所以這裡走 write_field_synced（顯示值＋經驗值一起寫）。
+                for fi in 0..GROWTH_FIELD_N {
+                    ui.label(FIELD_NAMES[fi]);
+                    if ui.add(egui::Slider::new(&mut cur.field[fi], 0..=99)).changed() {
+                        let ok = write_field_synced(P!(), obj, fi, cur.field[fi]);
+                        act = Some((ok, format!("{}（含經驗值）", FIELD_NAMES[fi])));
+                    }
+                    ui.end_row();
+                }
+
+                // 捕手配球（+0x2C bit4~6）。捕手以外的選手一律 G，遊戲也不顯示。
+                ui.label("捕手配球")
+                    .on_hover_text("畫面右下角那個 G~S。存在 +0x2C 的 bit4~6，\n\
+                                    同一 byte 還有別的旗標, 所以是讀-改-寫。\n\
+                                    捕手以外的選手遊戲不顯示這一項。");
+                if let Some(g) = grade_btn(ui, cur.catcher, &GS_OPTS, 52.0) {
+                    cur.catcher = g;
+                    let ok = write_catcher(P!(), obj, g);
+                    act = Some((ok, "捕手配球".into()));
+                }
+                ui.end_row();
+
+                ui.label("年級（栄冠）");
+                if ui.add(egui::Slider::new(&mut cur.grade, 1..=3)).changed() {
+                    let ok = P!().write(obj + OFF_GRADE, &[cur.grade]);
+                    act = Some((ok, "年級".into()));
+                }
+                ui.end_row();
+
+                ui.label("球棒道具已用 / 上限1");
+                if ui.add(egui::Slider::new(&mut cur.item, 0..=9)).changed() {
+                    let ok = P!().write(obj + OFF_ITEM, &[cur.item]);
+                    act = Some((ok, "球棒使用次數".into()));
+                }
+                ui.end_row();
+
+                ui.label("書籍已用 / 上限依學歷");
+                if ui.add(egui::Slider::new(&mut cur.book, 0..=9)).changed() {
+                    let ok = P!().write(obj + OFF_BOOK, &[cur.book]);
+                    act = Some((ok, "書籍使用次數".into()));
+                }
+                ui.end_row();
+            });
+            if ui.button("道具/書籍使用次數歸零（＝無限使用）").clicked() {
+                cur.item = 0;
+                cur.book = 0;
+                let ok = P!().write(obj + OFF_ITEM, &[0, 0]);
+                act = Some((ok, "使用次數歸零".into()));
+            }
+        });
+
+        // ── 擅長・不擅長球路（九宮格）
+        egui::CollapsingHeader::new("擅長・不擅長球路（九宮格）")
+            .default_open(true)
+            .show(ui, |ui| {
+                ui.label("排法跟遊戲畫面一樣（左上→右下）。左鍵 +1，超過 +3 繞回 −3；右鍵直接選。")
+                    .on_hover_text("+0xA50 起 9 個 3-bit 欄位, 3-bit 二補數編碼。\n\
+                                    27 bits 用掉、高 5 bits 是別的東西, 所以整個 u32 讀-改-寫。");
+                let mut changed = false;
+                egui::Grid::new("zone").num_columns(3).spacing([4.0, 4.0]).show(ui, |ui| {
+                    for r in 0..3 {
+                        for c in 0..3 {
+                            let i = r * 3 + c;
+                            if let Some(nv) = zone_btn(ui, cur.zone[i]) {
+                                cur.zone[i] = nv;
+                                changed = true;
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+                if changed {
+                    let ok = write_zone(P!(), obj, &cur.zone);
+                    act = Some((ok, "擅長球路九宮格".into()));
+                }
+                if ui.button("全部歸零").clicked() {
+                    cur.zone = [0; ZONE_N];
+                    let ok = write_zone(P!(), obj, &cur.zone);
+                    act = Some((ok, "擅長球路九宮格（歸零）".into()));
+                }
+            });
+
+        // ── 能力值
+        egui::CollapsingHeader::new("能力值").default_open(true).show(ui, |ui| {
+            egui::Grid::new("stats").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                for i in 0..8 {
+                    ui.label(STAT_NAMES[i]);
+                    let mut v = cur.stats[i];
+                    // 上限 99 —— 遊戲自己的換算就夾在 99（exe+62A7A30 的 min(…, 0x63)），
+                    // 拉到 127 只是寫個遊戲不承認的值
+                    if ui.add(egui::Slider::new(&mut v, 1..=STAT_UI_MAX)).changed() {
+                        cur.stats[i] = v;
+                        let ok = write_stat_synced(P!(), obj, i, v);
+                        act = Some((ok, STAT_NAMES[i].into()));
+                    }
+                    ui.label(grade_of(cur.stats[i]));
+                    ui.end_row();
+                }
+            });
+        });
+
+        // ── 特殊能力（+0x08..0x15 的 28 個 nibble）
+        egui::CollapsingHeader::new("特殊能力").default_open(true).show(ui, |ui| {
+            // 等級格：低 3 bit ＝ 以 D 為 0 的 signed 等級，bit3 ＝ 另一個獨立能力。
+            // ⚠ 值 4（＝−4）超出等級表，實測必崩 —— 所以下拉選單裡根本不提供。
+            ui.label(egui::RichText::new("等級能力（選單裡沒有會當機的值，可以放心拉）").strong());
+            // ★ 明星選手模式專用：等級與 bit3 附加能力擠在同一個 nibble，
+            //   遊戲升級時整個 nibble 重寫 → 同格的 bit3 會被洗掉（＝「學新技能後被重置」）。
+            //   拉到最高就不會再升級, bit3 也就保得住。
+            if growth.is_some() {
+                if ui
+                    .button("★ 等級全部拉到最高（保留附加能力）")
+                    .on_hover_text(
+                        "把 11 個等級格拉到「觀察過的最高等級」, 並保留各格的 bit3 附加能力。\n\
+                         為什麼要這樣: 等級(低3bit)與 bit3 擠在同一個 nibble, \
+                         遊戲升級時是整個 nibble 重寫 —— 所以每升一級就會把同格的\
+                         附加能力洗掉。拉到最高就不會再升級。\n\
+                         ⚠ 逐格從 A 往下找「1491 位真實選手身上出現過」的值, \
+                         不會寫出沒觀察過的組合（那會讓遊戲當掉）。\n\
+                         ⚠ 犀利度／尾勁本來就沒有的話不會無中生有。")
+                    .clicked()
+                {
+                    let n = self.proc.as_ref().and_then(|p| max_abil_grades(p, obj));
+                    act = Some((n.is_some(), match n {
+                        Some(k) => format!("等級拉滿（改了 {k} 格，附加能力保留）"),
+                        None => "等級拉滿失敗".into(),
+                    }));
+                    need_reload = true;
+                }
+                ui.label(
+                    egui::RichText::new(
+                        "明星選手：特殊能力**不走經驗值**, 直接改就會留住（已實測）。\
+                         但等級升級會洗掉同格的附加能力, 所以建議先按上面那顆。")
+                        .small().weak(),
+                );
+            }
+            egui::Grid::new("abil_graded").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                for &n in ABIL_GRADED {
+                    let optional = ABIL_GRADED_OPTIONAL.contains(&n);
+                    let nib = abil_nib(&cur.abil, n);
+                    let (lv, extra) = (nib & 7, nib & 8 != 0);
+
+                    ui.label(abil_name(n));
+
+                    // 低→高排列（grade_btn 要的順序）。
+                    // ⚠ 值 4（＝signed −4）超出等級表, 實測必崩 —— 所以清單裡根本沒有它,
+                    //   點擊循環也就不可能踩到。
+                    // ⚠ 選配型（犀利度／尾勁）的 0 是「沒有這個能力」而不是 D。
+                    let mut opts: Vec<(u8, &str)> =
+                        vec![(5, "G"), (6, "F"), (7, "E"), (0, "D"), (1, "C"), (2, "B"), (3, "A")];
+                    if optional {
+                        opts.retain(|&(v, _)| v != 0);
+                        opts.insert(0, (0, "（無）"));
+                    }
+                    if let Some(newlv) = grade_btn(ui, lv, &opts, 78.0) {
+                        let nv = (nib & 8) | newlv;
+                        let ok = write_abil_nibble(P!(), obj, n, nv);
+                        set_nib(&mut cur.abil, n, nv);
+                        act = Some((ok, format!("{} 等級", abil_name(n))));
+                    }
+
+                    let bit3 = ABIL_GRADED_BIT3.iter().find(|e| e.0 == n).map(|e| e.1).unwrap_or("");
+                    let mut on = extra;
+                    if !bit3.is_empty() && ui.checkbox(&mut on, bit3).changed() {
+                        let nv = (nib & 7) | if on { 8 } else { 0 };
+                        let ok = write_abil_nibble(P!(), obj, n, nv);
+                        set_nib(&mut cur.abil, n, nv);
+                        act = Some((ok, bit3.into()));
+                    }
+                    ui.end_row();
+                }
+            });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.label(egui::RichText::new("變體能力（一列 ＝ 一個 nibble 的 4 個 bit）").strong());
+            ui.label(egui::RichText::new(
+                "⚠ 同一列的 bit0/bit1 是一組、bit2/bit3 是一組。同組兩者若是同一能力的\
+                 正負或輕重版本，同時勾選時畫面只會畫其中一個（不是沒寫進去）。")
+                .weak().small());
+
+            egui::Grid::new("abil_bits").num_columns(5).spacing([8.0, 3.0]).show(ui, |ui| {
+                for n in 0..ABIL_NIBBLES {
+                    if abil_is_graded(n) {
+                        continue;
+                    }
+                    let nib = abil_nib(&cur.abil, n);
+                    ui.label(egui::RichText::new(format!("n{n:<2}")).weak().small());
+                    for b in 0..4u8 {
+                        let name = ABIL_BITS.iter()
+                            .find(|e| e.0 == n && e.1 == b)
+                            .map(|e| e.2).unwrap_or("—");
+                        let mut on = nib >> b & 1 == 1;
+                        if ui.add_enabled(name != "—", egui::Checkbox::new(&mut on, name))
+                            .changed()
+                        {
+                            let nv = if on { nib | 1 << b } else { nib & !(1 << b) };
+                            let ok = write_abil_nibble(P!(), obj, n, nv);
+                            set_nib(&mut cur.abil, n, nv);
+                            // 這個組合值沒在 1491 位真實選手身上出現過 —— 多半沒事，
+                            // 但既然有崩潰前例就講清楚，不要讓使用者以為是位址失效。
+                            let warn = ABIL_SEEN_VALS[n] >> nv & 1 == 0;
+                            act = Some((ok, if warn {
+                                format!("{name}　⚠ n{n}={nv} 這個組合沒觀察過，若畫面卡住就重開讀檔")
+                            } else {
+                                name.into()
+                            }));
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                if ui.button("全部清空").clicked() {
+                    let ok = P!().write(obj + OFF_ABIL2, &[0u8; ABIL_BYTES]);
+                    cur.abil = [0; ABIL_BYTES];
+                    act = Some((ok, "特殊能力全部清空".into()));
+                }
+                ui.label(egui::RichText::new(format!(
+                    "現值 {}",
+                    cur.abil.iter().map(|b| format!("{b:02x}"))
+                        .collect::<Vec<_>>().join(" ")))
+                    .weak().small().monospace());
+            });
+        });
+
+        // ── 球種
+        egui::CollapsingHeader::new("球種").default_open(true).show(ui, |ui| {
+            ui.checkbox(&mut self.cross_dir,
+                        "允許跨系統（遊戲不擋，但畫面會出現「直球位置放滑球」這種怪東西）");
+            ui.separator();
+            // 依官方的 6 系統排列（直球系在前，跟球種 ID 分段一致），
+            // 而且同一系的兩顆排在一起 —— slot i 與 slot i+6 是同一系。
+            for dir in DIR_ORDER {
+                for second in [false, true] {
+                    let slot = dir + if second { 6 } else { 0 };
+                    let tag = format!("{}・第{}顆", DIR_SERIES[dir], if second { 2 } else { 1 });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(format!(
+                        "{}{}", DIR_SERIES[dir], if second { "・第2顆" } else { "・第1顆" }))
+                        .strong());
+                    ui.label(egui::RichText::new(format!("{}　slot{slot}", DIR_UI[dir]))
+                        .weak().small());
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(12.0);
+                    let opts: Vec<u8> = if self.cross_dir {
+                        let mut v = vec![BALL_EMPTY, BALL_ORIGINAL];
+                        v.extend(BALL_NAMES.iter().map(|e| e.0).filter(|&i| i != BALL_ORIGINAL));
+                        v
+                    } else {
+                        balls_for_dir(dir)
+                    };
+                    let mut id = cur.balls[slot].id;
+                    egui::ComboBox::from_id_source(("ball", slot))
+                        .width(210.0)
+                        .selected_text(cur.ball_label(slot))
+                        .show_ui(ui, |ui| {
+                            for o in opts {
+                                let txt = if o == BALL_ORIGINAL {
+                                    "原創球種（下面選要哪一顆）".to_string()
+                                } else {
+                                    ball_name(o)
+                                };
+                                ui.selectable_value(&mut id, o, txt);
+                            }
+                        });
+                    if id != cur.balls[slot].id {
+                        let was_orig = cur.balls[slot].id == BALL_ORIGINAL;
+                        cur.balls[slot].id = id;
+                        if id != BALL_EMPTY && cur.balls[slot].power == 0 {
+                            cur.balls[slot].power = 7;
+                            cur.balls[slot].control = 7;
+                            cur.balls[slot].move_ = if dir == 5 { 0 } else { 4 };
+                        }
+                        let b = cur.balls[slot].clone();
+                        // ★ 明星選手：write_ball_synced 會一併寫該 slot 的三格經驗值,
+                        //   否則下次結算會依經驗值（新球是 0）把三項算回 G。
+                        let mut ok = write_ball_synced(P!(), obj, slot, &b);
+                        // 換掉原創球種時把那筆記錄一起清掉, 避免留下孤兒記錄
+                        if was_orig && id != BALL_ORIGINAL {
+                            if let Some(ri) = cur.recs.iter().position(|r| r.slot == slot as u32) {
+                                ok &= clear_rec(P!(), obj, ri);
+                            }
+                        }
+                        need_reload = true;
+                        act = Some((ok, format!("{tag} 球種")));
+                    }
+
+                    if cur.balls[slot].id != BALL_EMPTY {
+                        let mut changed = false;
+                        ui.label("球威");
+                        if let Some(n) = grade_btn(ui, cur.balls[slot].power, &GS_OPTS, 46.0) {
+                            cur.balls[slot].power = n;
+                            changed = true;
+                        }
+                        ui.label("控球");
+                        if let Some(n) = grade_btn(ui, cur.balls[slot].control, &GS_OPTS, 46.0) {
+                            cur.balls[slot].control = n;
+                            changed = true;
+                        }
+                        if dir != 5 {
+                            ui.label("變化量");
+                            let mut mv = cur.balls[slot].move_;
+                            if ui.add(egui::Slider::new(&mut mv, 0..=7).show_value(true)).changed() {
+                                cur.balls[slot].move_ = mv;
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            let b = cur.balls[slot].clone();
+                            let ok = write_ball_synced(P!(), obj, slot, &b);
+                            act = Some((ok, format!("{tag} 球威/控球/變化（含經驗值）")));
+                        }
+                    }
+                });
+
+                // ── 這一格是原創球種 → 直接在這裡挑要哪一顆（每個 slot 各自獨立）
+                if cur.balls[slot].id == BALL_ORIGINAL {
+                    ui.horizontal(|ui| {
+                        ui.add_space(28.0);
+                        if self.lib.is_empty() {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(230, 170, 80),
+                                "沒有球種庫 → 畫面只會顯示「原創」。\
+                                 按最上面的「⟳ 蒐集原創球種到球種庫」",
+                            );
+                            return;
+                        }
+                        let curname = cur
+                            .rec_for_slot(slot)
+                            .map(|r| r.name.clone())
+                            .unwrap_or_default();
+                        let opts: Vec<usize> = (0..self.lib.len())
+                            .filter(|&i| self.cross_dir || self.lib[i].dir == dir)
+                            .collect();
+                        let sel_txt = if curname.is_empty() {
+                            "（未設定→畫面只顯示「原創」，點這裡挑一顆）".to_string()
+                        } else {
+                            zh_name(&curname)
+                        };
+                        let mut pick: Option<usize> = None;
+                        ui.label("↳ 原創內容");
+                        egui::ComboBox::from_id_source(("orig", slot))
+                            .width(330.0)
+                            .selected_text(sel_txt)
+                            .show_ui(ui, |ui| {
+                                for i in opts {
+                                    let e = &self.lib[i];
+                                    let txt = format!(
+                                        "{}　[{}]　基底 {}　{}",
+                                        zh_name(&e.name), e.kind, ball_name(e.base), e.holder
+                                    );
+                                    if ui.selectable_label(e.name == curname, txt).clicked() {
+                                        pick = Some(i);
+                                    }
+                                }
+                            });
+                        if let Some(i) = pick {
+                            let p = match &self.proc { Some(p) => p, None => return };
+                            let e = &self.lib[i];
+                            let ri = find_rec_index(p, obj, slot);
+                            match ri {
+                                Some(ri) => {
+                                    let ok = write_rec(p, obj, ri, &e.raw, slot);
+                                    need_reload = true;
+                                    act = Some((ok, format!("{tag} 原創「{}」", e.name)));
+                                }
+                                None => act = Some((false, "12 筆原創記錄都滿了".into())),
+                            }
+                        }
+                    });
+                }
+                ui.add_space(2.0);
+                } // for second（同一系的第 1／第 2 顆）
+                ui.separator();
+            } // for dir（6 個球種系統）
+            ui.horizontal(|ui| {
+                if ui.button("全部球威/控球 → S").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY {
+                            cur.balls[s].power = 7;
+                            cur.balls[s].control = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "全部球種 S/S".into()));
+                }
+                if ui.button("變化量全部 → 7（直球系除外）").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY && s % 6 != 5 {
+                            cur.balls[s].move_ = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "變化量 7".into()));
+                }
+            });
+        });
+
+        // ── 原創球種：總覽（實際挑選在上面每一格的「↳ 原創內容」）
+        //    ⚠ 蒐集按鈕不放這裡 —— 它是對整個球種庫做的事, 跟選中誰無關,
+        //      而且這一區要先選到選手才畫得出來。放在頂端工具列。
+        egui::CollapsingHeader::new("原創球種 — 目前的記錄").default_open(false).show(ui, |ui| {
+            ui.label("球種陣列寫 ID36 只是旗標，名稱與效果來自這些記錄（每位選手最多 12 筆，\
+                      一筆對應一個 slot）。要挑哪一顆請在上面「球種」區各格的『↳ 原創內容』選。");
+            ui.separator();
+            let mut any = false;
+            for (i, r) in cur.recs.iter().enumerate() {
+                if r.slot >= REC_UNUSED_SLOT && r.name.is_empty() {
+                    continue;
+                }
+                any = true;
+                ui.label(format!("　rec#{i}　slot{}（方向{}）　{}　[{}]　基底 {}",
+                                 r.slot, r.slot as usize % 6, zh_name(&r.name),
+                                 if r.official { "官方" } else { "自訂" },
+                                 ball_name(r.base)));
+            }
+            if !any {
+                ui.label("　（無）");
+            }
+        });
+
+        self.cur = Some(cur);
+        if let Some(i) = switch {
+            self.sel = Some(i);
+            self.reload_current();
+            self.status = format!(
+                "已切到第 {} 份副本（物件 {:#x}）—— 改完切換畫面看看這份有沒有生效",
+                sibs.iter().position(|&x| x == i).map_or(0, |k| k + 1),
+                self.list[i].addr
+            );
+            return;
+        }
+        if let Some((ok, what)) = act {
+            if what == "（重新讀取）" {
+                self.reload_current();
+            } else {
+                self.write_ok(ok, &what);
+                if need_reload {
+                    self.reload_current();
+                }
+            }
+        }
+    }
+}
+
+fn main() -> eframe::Result<()> {
+    let opts = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1100.0, 800.0])
+            .with_min_inner_size([820.0, 560.0]),
+        ..Default::default()
+    };
+    eframe::run_native(
+        "prospi 選手編輯器",
+        opts,
+        Box::new(|cc| Ok(Box::new(App::new(cc)))),
+    )
+}

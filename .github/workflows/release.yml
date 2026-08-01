@@ -1,0 +1,48 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item target/release/pedit.exe dist/
+          Copy-Item origlib.json dist/
+          Copy-Item README.md dist/
+          Copy-Item LICENSE dist/
+          Compress-Archive -Path dist/* -DestinationPath pedit-windows-x64.zip -Force
+
+      - name: Upload to release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # release 可能已經手動建好了，先試 create、失敗就改成 upload
+          gh release create $env:GITHUB_REF_NAME pedit-windows-x64.zip --generate-notes
+          if ($LASTEXITCODE -ne 0) {
+            gh release upload $env:GITHUB_REF_NAME pedit-windows-x64.zip --clobber
+          }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pedit-windows-x64
+          path: pedit-windows-x64.zip

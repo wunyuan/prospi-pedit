@@ -1,0 +1,27 @@
+[package]
+name = "prospi"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "prospi"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pedit"
+path = "src/bin/pedit.rs"
+required-features = ["gui"]
+
+[features]
+default = ["gui"]
+# GUI 只有 pedit 需要。私有工具 crate 用 default-features = false 依賴本 crate，
+# 就不會把 eframe 拖進去（編譯快很多）。
+gui = ["dep:eframe"]
+
+[dependencies]
+eframe = { version = "0.28", optional = true, default-features = false, features = ["glow", "default_fonts"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 2
+codegen-units = 4
