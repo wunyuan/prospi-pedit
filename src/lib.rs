@@ -756,6 +756,18 @@ pub struct Player {
     pub pos: u8,
     /// `+0x2C` bit4~6 捕手配球（0=G … 7=S）
     pub catcher: u8,
+    /// 栄冠「野手風格／打擊積極性」等級（0=G … 6=A；沒有 S）。
+    /// 畫面等級由 +0xA5B low3 決定；+0x10AE low3 是同步值。
+    pub batting_aggression: u8,
+    /// 栄冠「野手風格／選球眼」等級（0=G … 6=A；沒有 S）。
+    /// 畫面等級由 +0xA53 bit3~5 決定；+0x10AA low3 是同步值。
+    pub plate_discipline: u8,
+    /// 栄冠「野手風格／人氣」。
+    /// +0xA30 low3：實測 1=無、2=有；同 byte 的 bit3~6 是主要守備位置。
+    pub popularity: bool,
+    /// 栄冠的打擊姿勢/打球型態（0..6；見 [`BATTING_STYLE_NAMES`]）。
+    /// 由 +0x2C bit7、+0x2D low2、+0xFB6 low3 三欄聯合判定；未知組合為 0xFF。
+    pub batting_style: u8,
     /// `+0xA16` 隊伍 ID（明星選手模式用來分隊）
     pub team: u8,
     /// `+0xA50` 擅長・不擅長球路九宮格，畫面列優先，各 −3..+3
@@ -862,6 +874,11 @@ impl Player {
             defense: u8a(OFF_DEF),
             pos: ((u16::from_le_bytes([b[OFF_POS], b[OFF_POS + 1]]) >> POS_SHIFT) & 0xF) as u8,
             catcher: (u8a(OFF_CATCH) >> CATCH_SHIFT) & 7,
+            batting_aggression: u8a(OFF_BATTING_AGGRESSION) & 7,
+            plate_discipline: (u8a(OFF_PLATE_DISCIPLINE) >> PLATE_DISCIPLINE_SHIFT) & 7,
+            popularity: (u8a(OFF_POPULARITY) & POPULARITY_MASK) == POPULARITY_ON,
+            batting_style: batting_style_from_raw(u8a(OFF_CATCH), u8a(OFF_BATTING_STYLE), u8a(OFF_BATTING_SYNC))
+                .unwrap_or(BATTING_STYLE_UNKNOWN),
             team: u8a(OFF_TEAM),
             speed: (pack & 0x7F) + 80,
             stamina: (pack >> 7) & 0x7F,
@@ -1661,6 +1678,87 @@ pub fn write_catcher(p: &Proc, obj: usize, v: u8) -> bool {
     p.write(obj + OFF_CATCH, &[nv])
 }
 
+/// 寫入栄冠「打擊積極性」等級（0=G … 6=A；沒有 S）。
+///
+/// 實測對照：
+/// G: A5B=00 / 10AE=07
+/// F: A5B=01 / 10AE=06
+/// E: A5B=02 / 10AE=05
+/// D: A5B=03 / 10AE=04
+/// C: A5B=04 / 10AE=03
+/// B: A5B=05 / 10AE=02
+/// A: A5B=06 / 10AE=01
+///
+/// 兩處都只改 low3；其他未知旗標全部保留。
+pub fn write_batting_aggression(p: &Proc, obj: usize, grade: u8) -> bool {
+    if grade > 6 {
+        return false;
+    }
+
+    let a = p.u8_at(obj + OFF_BATTING_AGGRESSION);
+    let na = (a & !0x07) | (grade & 0x07);
+
+    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
+    let sync = 7 - grade;
+    let b = p.u8_at(obj + OFF_BATTING_AGGRESSION_SYNC);
+    let nb = (b & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_BATTING_AGGRESSION, &[na])
+        && p.write(obj + OFF_BATTING_AGGRESSION_SYNC, &[nb])
+}
+
+/// 寫入栄冠「選球眼」等級（0=G … 6=A；沒有 S）。
+///
+/// 實測對照：
+/// G: A53=00 / 10AA=07
+/// F: A53=08 / 10AA=06
+/// E: A53=10 / 10AA=05
+/// D: A53=18 / 10AA=04
+/// C: A53=20 / 10AA=03
+/// B: A53=28 / 10AA=02
+/// A: A53=30 / 10AA=01
+///
+/// +0xA53 只改 bit3~5，+0x10AA 只改 low3；其他未知旗標全部保留。
+pub fn write_plate_discipline(p: &Proc, obj: usize, grade: u8) -> bool {
+    if grade > 6 {
+        return false;
+    }
+
+    let a = p.u8_at(obj + OFF_PLATE_DISCIPLINE);
+    let na = (a & !PLATE_DISCIPLINE_MASK) | ((grade & 7) << PLATE_DISCIPLINE_SHIFT);
+
+    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
+    let sync = 7 - grade;
+    let b = p.u8_at(obj + OFF_PLATE_DISCIPLINE_SYNC);
+    let nb = (b & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_PLATE_DISCIPLINE, &[na])
+        && p.write(obj + OFF_PLATE_DISCIPLINE_SYNC, &[nb])
+}
+
+/// 寫入栄冠「人氣」旗標。
+///
+/// 三位不同球員以書本取得人氣時都觀察到：
+/// * `+0xA30 low3: 1 -> 2`
+/// * `+0x10B6 low3: 1 -> 2`
+///
+/// 手動切換 `+0xA30 low3` 已驗證 `1=人氣消失`、`2=人氣出現`；
+/// `+0x10B6` 單獨切換不影響即時顯示，但可能是成長／結算同步欄位。
+/// 為了讓推進日期時的遊戲結算狀態也一致，兩處同步寫入。
+/// `+0xA30` 的 bit3~6 同時存主要守備位置，所以兩處都只做讀-改-寫 low3。
+pub fn write_popularity(p: &Proc, obj: usize, on: bool) -> bool {
+    let v = if on { POPULARITY_ON } else { POPULARITY_OFF };
+
+    let cur = p.u8_at(obj + OFF_POPULARITY);
+    let nv = (cur & !POPULARITY_MASK) | v;
+
+    let sync_cur = p.u8_at(obj + OFF_POPULARITY_SYNC);
+    let sync_nv = (sync_cur & !POPULARITY_MASK) | v;
+
+    p.write(obj + OFF_POPULARITY, &[nv])
+        && p.write(obj + OFF_POPULARITY_SYNC, &[sync_nv])
+}
+
 /// 寫入九宮格。只動低 27 bits，高 5 bits（別的欄位）原樣保留。
 pub fn write_zone(p: &Proc, obj: usize, z: &[i8; ZONE_N]) -> bool {
     let mut raw = p.u32_at(obj + OFF_ZONE);
@@ -1897,6 +1995,97 @@ pub fn save_teams(
     std::fs::write(path, txt).map_err(|e| format!("寫入 {} 失敗：{e}", path.display()))
 }
 
+// ─────────────────────────────────────────────── 栄冠：野手風格（打擊積極性／選球眼）
+
+/// 打擊積極性顯示等級：`+0xA5B` low3。
+/// 實測 0..6 分別為 G/F/E/D/C/B/A，沒有 S。
+pub const OFF_BATTING_AGGRESSION: usize = 0xA5B;
+
+/// 打擊積極性同步欄位：`+0x10AE` low3。
+/// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+pub const OFF_BATTING_AGGRESSION_SYNC: usize = 0x10AE;
+
+/// 選球眼顯示等級：`+0xA53` bit3~5。
+/// 實測 0..6 分別為 G/F/E/D/C/B/A，沒有 S。
+pub const OFF_PLATE_DISCIPLINE: usize = 0xA53;
+pub const PLATE_DISCIPLINE_SHIFT: u32 = 3;
+pub const PLATE_DISCIPLINE_MASK: u8 = 0x38;
+
+/// 選球眼同步欄位：`+0x10AA` low3。
+/// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+pub const OFF_PLATE_DISCIPLINE_SYNC: usize = 0x10AA;
+
+/// 人氣直接顯示欄位與主要守備位置共用 `+0xA30`。
+/// low3 實測：1=無人氣、2=有人氣；bit3~6 是主要守備位置，絕對不能整 byte 覆蓋。
+pub const OFF_POPULARITY: usize = OFF_POS;
+pub const POPULARITY_MASK: u8 = 0x07;
+pub const POPULARITY_OFF: u8 = 0x01;
+pub const POPULARITY_ON: u8 = 0x02;
+
+/// 人氣同步／結算欄位：`+0x10B6` low3。
+/// 三位球員以書本取得人氣時皆觀察到 1 -> 2；單獨改此欄不影響即時顯示。
+pub const OFF_POPULARITY_SYNC: usize = 0x10B6;
+
+// ─────────────────────────────────────────────── 栄冠：打擊姿勢 / 打球型態
+
+/// 打擊姿勢主欄位：`+0x2D` 的 low 2 bits。
+/// 實測 high bits（例如 0x04）不影響這組能力顯示，所以寫入時保留它們。
+pub const OFF_BATTING_STYLE: usize = 0x2D;
+
+/// 打擊姿勢同步欄位：`+0xFB6` 的 low 3 bits。
+/// 目前只確認 0..6；其餘 high bits 保留，避免破壞未知旗標。
+pub const OFF_BATTING_SYNC: usize = 0xFB6;
+
+pub const BATTING_STYLE_UNKNOWN: u8 = 0xFF;
+pub const BATTING_STYLE_NAMES: [&str; 7] = [
+    "滾地球型", "低仰角", "中仰角", "高仰角", "平飛球強襲", "力量型打者", "全壘打藝術家",
+];
+
+/// (2C bit7, 2D low2, FB6 low3)。
+/// 2026-08-23 以兩位栄冠球員交叉驗證：低仰角／力量型打者／全壘打藝術家完全一致；
+/// 第一位另完整測得全部 7 種。
+pub const BATTING_STYLE_RAW: [(bool, u8, u8); 7] = [
+    (false, 0, 0), // 滾地球型
+    (true,  0, 1), // 低仰角
+    (true,  1, 3), // 中仰角
+    (false, 2, 4), // 高仰角
+    (false, 1, 2), // 平飛球強襲
+    (true,  2, 5), // 力量型打者
+    (false, 3, 6), // 全壘打藝術家
+];
+
+pub fn batting_style_name(v: u8) -> &'static str {
+    BATTING_STYLE_NAMES.get(v as usize).copied().unwrap_or("未知組合")
+}
+
+/// 從三個實際欄位判定目前打擊姿勢；不認識的組合回 None。
+pub fn batting_style_from_raw(c2c: u8, c2d: u8, fb6: u8) -> Option<u8> {
+    let key = (c2c & 0x80 != 0, c2d & 0x03, fb6 & 0x07);
+    BATTING_STYLE_RAW.iter().position(|&x| x == key).map(|i| i as u8)
+}
+
+/// 寫入栄冠打擊姿勢。
+/// +0x2C 只動 bit7（bit4~6 是捕手配球）；+0x2D 只動 low2；+0xFB6 只動 low3。
+/// 三欄都採 read-modify-write，保留各自未確認的其他 bits。
+pub fn write_batting_style(p: &Proc, obj: usize, style: u8) -> bool {
+    let Some(&(bit7, d, sync)) = BATTING_STYLE_RAW.get(style as usize) else {
+        return false;
+    };
+
+    let c2c = p.u8_at(obj + OFF_CATCH);
+    let n2c = if bit7 { c2c | 0x80 } else { c2c & !0x80 };
+
+    let c2d = p.u8_at(obj + OFF_BATTING_STYLE);
+    let n2d = (c2d & !0x03) | (d & 0x03);
+
+    let cfb6 = p.u8_at(obj + OFF_BATTING_SYNC);
+    let nfb6 = (cfb6 & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_CATCH, &[n2c])
+        && p.write(obj + OFF_BATTING_STYLE, &[n2d])
+        && p.write(obj + OFF_BATTING_SYNC, &[nfb6])
+}
+
 /// 捕手配球（G~S）＝ `+0x2C` 的 **bit4~6**（3 bits，0=G … 7=S）。
 ///
 /// ⚠ 同一個 byte 的其他 bit 是別的旗標（實測 bit7 大多為 1），寫入務必讀-改-寫。
@@ -1945,6 +2134,19 @@ pub fn pos_of(p: &Proc, obj: usize) -> u8 {
 
 pub const POS_NAMES: [&str; 9] = ["P", "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF"];
 
+/// 寫入主要守備位置（0=P … 8=RF）。
+/// `+0xA30` 只有 bit3~6 是位置，其他 bit 屬於同一區塊的其他欄位，必須保留。
+/// 超出已確認的 0..=8 一律拒絕，避免把未定義位置寫進存檔物件。
+pub fn write_pos(p: &Proc, obj: usize, v: u8) -> bool {
+    if v as usize >= POS_NAMES.len() {
+        return false;
+    }
+    let cur = p.u16_at(obj + OFF_POS);
+    let mask = 0xFu16 << POS_SHIFT;
+    let nv = (cur & !mask) | (((v as u16) << POS_SHIFT) & mask);
+    p.write(obj + OFF_POS, &nv.to_le_bytes())
+}
+
 /// 介面滑桿的上限 ＝ 遊戲實際承認的上限。
 /// 球速 175：patch 掉程式碼上限後資料能到 207，但**實戰投出來仍然是 175**，沒有意義。
 /// 能力值 99：換算函式自己就 `min(…, 0x63)`。
@@ -1983,12 +2185,16 @@ mod player_tests {
         b[OFF_PACK] = pack as u8;
         b[OFF_PACK + 1] = (pack >> 8) as u8;
         b[OFF_CATCH] = (7 << CATCH_SHIFT) | 0x80; // 捕手配球 S ＋ 同 byte 的別的旗標
+        b[OFF_BATTING_AGGRESSION] = 4 | 0xA0; // 打擊積極性 C ＋ 其他旗標
+        b[OFF_BATTING_AGGRESSION_SYNC] = 3 | 0xA0;
+        b[OFF_PLATE_DISCIPLINE] = (4 << PLATE_DISCIPLINE_SHIFT) | 0x85; // 選球眼 C ＋ 其他旗標
+        b[OFF_PLATE_DISCIPLINE_SYNC] = 0xA0 | 3; // C 的同步值 3 ＋ 高位其他旗標
         b[OFF_GRADE] = 3;
         b[OFF_ITEM] = 1;
         b[OFF_BOOK] = 5;
         b[OFF_TEAM] = 7;
         // 守備位置 SS(5) 放在 +0xA30 的 bit3
-        let posw: u16 = 5 << POS_SHIFT;
+        let posw: u16 = (5 << POS_SHIFT) | POPULARITY_ON as u16;
         b[OFF_POS] = posw as u8;
         b[OFF_POS + 1] = (posw >> 8) as u8;
         // 九宮格：第 0 格 +3、第 1 格 −3
@@ -2022,6 +2228,9 @@ mod player_tests {
         assert_eq!(pl.stamina, 83);
         assert_eq!(pl.pack_hi, 0xC000, "bit14-15 的旗標要原樣保留");
         assert_eq!(pl.catcher, 7, "捕手配球只能取 bit4~6，不能被同 byte 的旗標污染");
+        assert_eq!(pl.batting_aggression, 4, "打擊積極性 C 應由 +0xA5B low3 解析");
+        assert_eq!(pl.plate_discipline, 4, "選球眼 C 應由 +0xA53 bit3~5 解析");
+        assert!(pl.popularity, "人氣應由 +0xA30 low3=2 解析");
         assert_eq!(pl.pos, 5);
         assert_eq!(pl.team, 7);
         assert_eq!(pl.grade, 3);
@@ -2050,6 +2259,10 @@ mod player_tests {
             ("姓名", OFF_NAME + 64),
             ("隊伍", OFF_TEAM + 1),
             ("守備位置", OFF_POS + 2),
+            ("打擊積極性", OFF_BATTING_AGGRESSION + 1),
+            ("打擊積極性同步", OFF_BATTING_AGGRESSION_SYNC + 1),
+            ("選球眼", OFF_PLATE_DISCIPLINE + 1),
+            ("選球眼同步", OFF_PLATE_DISCIPLINE_SYNC + 1),
             ("九宮格", OFF_ZONE + 4),
             ("年級", OFF_GRADE + 1),
             ("書籍", OFF_BOOK + 1),

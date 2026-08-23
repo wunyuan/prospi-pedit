@@ -205,6 +205,23 @@ enum Mode {
     Star,
 }
 
+/// 能力研究用的選手物件記憶體快照。
+#[derive(Clone)]
+struct ResearchSnapshot {
+    addr: usize,
+    name: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ResearchDiff {
+    off: usize,
+    before: u8,
+    after: u8,
+    xor: u8,
+}
+
+
 struct App {
     proc: Option<Proc>,
     err: String,
@@ -241,6 +258,21 @@ struct App {
     item_patch_scanned: bool,
     /// 目前選中選手的成長經驗值結構（在 reload_current 時算好, 不要每幀重算）
     growth_base: Option<usize>,
+    /// 能力研究：修改前快照。只存在修改器 RAM，不會寫回遊戲。
+    research_before: Option<ResearchSnapshot>,
+    /// 能力研究：最近一次比較結果。
+    research_diffs: Vec<ResearchDiff>,
+    /// 快照讀取長度。0x2000 比目前已知 PLAYER_READ(0x1520) 多留一些空間，
+    /// 仍可在 UI 改成已知範圍或更大的研究範圍。
+    research_len: usize,
+    /// 差分顯示時只看「恰好一個 bit 改變」的 byte，能快速排除大量計數器/數值變化。
+    research_single_bit_only: bool,
+    /// 任意 offset 研究工具：相對於目前選手物件的 offset（十六進位文字）。
+    research_offset_text: String,
+    /// 任意 offset 研究工具：準備寫入的單一 byte（十六進位文字）。
+    research_value_text: String,
+    /// 最近一次載入：(選手物件位址, offset, 原始值)。切換選手後不允許沿用。
+    research_loaded_byte: Option<(usize, usize, u8)>,
     cheats: Arc<Cheats>,
 }
 
@@ -277,6 +309,13 @@ impl App {
             item_patch_addr: None,
             item_patch_scanned: false,
             growth_base: None,
+            research_before: None,
+            research_diffs: Vec::new(),
+            research_len: 0x2000,
+            research_single_bit_only: true,
+            research_offset_text: "0x002D".into(),
+            research_value_text: String::new(),
+            research_loaded_byte: None,
             cheats: Arc::new(Cheats::default()),
         };
         spawn_cheat_worker(app.cheats.clone());
@@ -480,6 +519,262 @@ impl App {
             ),
             Err(e) => e,
         };
+    }
+
+    /// 能力研究：對目前選中的選手記錄修改前快照。
+    fn research_capture_before(&mut self) {
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "記錄失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        match p.read(obj, self.research_len) {
+            Some(data) if !data.is_empty() => {
+                let got = data.len();
+                self.research_before = Some(ResearchSnapshot {
+                    addr: obj,
+                    name: name.clone(),
+                    data,
+                });
+                self.research_diffs.clear();
+                self.status = format!(
+                    "能力研究：已記錄「{name}」修改前快照 {got:#x} bytes（物件 {obj:#x}）"
+                );
+            }
+            _ => self.status = "能力研究：讀取修改前快照失敗".into(),
+        }
+    }
+
+    /// 能力研究：讀取目前記憶體並與修改前快照比較。
+    fn research_compare_after(&mut self) {
+        let before = match self.research_before.clone() {
+            Some(v) => v,
+            None => {
+                self.status = "請先按「① 記錄修改前」".into();
+                return;
+            }
+        };
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        if obj != before.addr || name != before.name {
+            self.status = format!(
+                "能力研究：目前選中的是「{name}」({obj:#x})，不是快照中的「{}」({:#x})；請重新記錄修改前",
+                before.name, before.addr
+            );
+            return;
+        }
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "比較失敗：選手位址已失效；請重新整理後重新做一輪實驗".into();
+            return;
+        }
+        let after = match p.read(obj, before.data.len()) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                self.status = "能力研究：讀取修改後快照失敗".into();
+                return;
+            }
+        };
+        let n = before.data.len().min(after.len());
+        self.research_diffs.clear();
+        self.research_diffs.reserve(64);
+        for i in 0..n {
+            let a = before.data[i];
+            let b = after[i];
+            if a != b {
+                self.research_diffs.push(ResearchDiff {
+                    off: i,
+                    before: a,
+                    after: b,
+                    xor: a ^ b,
+                });
+            }
+        }
+        self.status = format!(
+            "能力研究：比較完成，共 {} 個 byte 有變化（掃描 {n:#x} bytes）",
+            self.research_diffs.len()
+        );
+    }
+
+    /// 把修改前快照與差分文字輸出到 exe 同層，方便保存實驗或傳給別人分析。
+    fn research_export(&mut self) {
+        let before = match self.research_before.as_ref() {
+            Some(v) => v,
+            None => {
+                self.status = "沒有可匯出的能力研究快照".into();
+                return;
+            }
+        };
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let base = format!("research_{stamp}");
+        let bin = dir.join(format!("{base}_before.bin"));
+        let txt = dir.join(format!("{base}_diff.txt"));
+        let mut report = String::new();
+        report.push_str(&format!(
+            "player={}\naddr={:#x}\nbytes={:#x}\ndiff_count={}\n\n",
+            before.name,
+            before.addr,
+            before.data.len(),
+            self.research_diffs.len()
+        ));
+        for d in &self.research_diffs {
+            let bit = if d.xor.count_ones() == 1 {
+                format!("bit{}", d.xor.trailing_zeros())
+            } else {
+                format!("{} bits", d.xor.count_ones())
+            };
+            report.push_str(&format!(
+                "+0x{:04X}  {:02X} -> {:02X}  XOR={:02X}  {}\n",
+                d.off, d.before, d.after, d.xor, bit
+            ));
+        }
+        let ok_bin = std::fs::write(&bin, &before.data);
+        let ok_txt = std::fs::write(&txt, report);
+        self.status = if ok_bin.is_ok() && ok_txt.is_ok() {
+            format!("能力研究已匯出：{}、{}", bin.display(), txt.display())
+        } else {
+            format!("能力研究匯出失敗：{}", dir.display())
+        };
+    }
+
+    /// 研究工具的十六進位輸入。接受 `0x002D`、`+0x002D`、`002D`。
+    fn parse_research_hex(text: &str) -> Option<usize> {
+        let t = text.trim();
+        let t = t.strip_prefix('+').unwrap_or(t);
+        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        usize::from_str_radix(t, 16).ok()
+    }
+
+    /// 從目前選手物件載入任意 offset 的單一 byte。
+    fn research_load_byte(&mut self) {
+        let off = match Self::parse_research_hex(&self.research_offset_text) {
+            Some(v) if v <= 0xFFFF => v,
+            _ => {
+                self.status = "Offset 格式錯誤：請輸入例如 0x002D（範圍 0x0000..0xFFFF）".into();
+                return;
+            }
+        };
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "載入失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        match p.read(obj + off, 1).and_then(|b| b.first().copied()) {
+            Some(v) => {
+                self.research_loaded_byte = Some((obj, off, v));
+                self.research_value_text = format!("{v:02X}");
+                self.status = format!(
+                    "任意 Offset：已載入「{name}」+0x{off:04X} = 0x{v:02X}"
+                );
+            }
+            None => self.status = format!("任意 Offset：讀取 +0x{off:04X} 失敗"),
+        }
+    }
+
+    /// 把研究工具輸入的單一 byte 寫回目前選手物件。
+    fn research_write_byte(&mut self) {
+        let (obj, off, old) = match self.research_loaded_byte {
+            Some(v) => v,
+            None => {
+                self.status = "請先按「載入」確認目前 offset 與原始值".into();
+                return;
+            }
+        };
+        let (cur_obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        if cur_obj != obj {
+            self.status = "目前選手已切換；請重新按「載入」後再寫入".into();
+            self.research_loaded_byte = None;
+            return;
+        }
+        // 使用者若改了 offset 輸入框，必須重新載入，避免畫面顯示 A offset 卻寫到舊的 B offset。
+        if Self::parse_research_hex(&self.research_offset_text) != Some(off) {
+            self.status = "Offset 已變更；請重新按「載入」再寫入".into();
+            return;
+        }
+        let nv = match Self::parse_research_hex(&self.research_value_text) {
+            Some(v) if v <= 0xFF => v as u8,
+            _ => {
+                self.status = "數值格式錯誤：請輸入 00..FF（十六進位）".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "寫入失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        let ok = p.write(obj + off, &[nv]);
+        if ok {
+            self.research_loaded_byte = Some((obj, off, nv));
+            self.status = format!(
+                "任意 Offset：+0x{off:04X} 已寫入 0x{old:02X} → 0x{nv:02X}（{name}）"
+            );
+        } else {
+            self.status = format!("任意 Offset：寫入 +0x{off:04X} 失敗");
+        }
     }
 
     fn write_ok(&mut self, ok: bool, what: &str) {
@@ -1144,6 +1439,222 @@ impl App {
         });
         ui.separator();
 
+        // ── 能力研究：記錄同一位選手「學技能前 / 學技能後」的物件記憶體並做 byte/bit 差分。
+        egui::CollapsingHeader::new("🔬 能力研究／記憶體差分")
+            .default_open(self.mode == Mode::Koshien)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "用法：先按①記錄目前狀態 → 回遊戲只讓這位選手取得一個目標能力 →\n\
+                         回來按②比較。修改器會列出物件內所有改變的 offset / byte / bit。"
+                    )
+                    .small(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("掃描範圍");
+                    egui::ComboBox::from_id_source("research_len")
+                        .selected_text(format!("+0x0000 ～ +0x{:04X}", self.research_len))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                PLAYER_READ,
+                                format!("已知選手物件 0x{PLAYER_READ:X}"),
+                            );
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                0x2000,
+                                "擴充 0x2000（建議）",
+                            );
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                0x4000,
+                                "擴充 0x4000（較多雜訊）",
+                            );
+                        });
+                    ui.checkbox(
+                        &mut self.research_single_bit_only,
+                        "結果只顯示單一 bit 變化",
+                    )
+                    .on_hover_text(
+                        "找旗標型能力時最有用。完整差分仍保留，可取消勾選查看全部。",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("① 記錄修改前").clicked() {
+                        self.research_capture_before();
+                    }
+                    let can_compare = self.research_before.is_some();
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("② 記錄修改後並比較"))
+                        .clicked()
+                    {
+                        self.research_compare_after();
+                    }
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("匯出快照 / 差分"))
+                        .clicked()
+                    {
+                        self.research_export();
+                    }
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("清除研究資料"))
+                        .clicked()
+                    {
+                        self.research_before = None;
+                        self.research_diffs.clear();
+                        self.status = "能力研究資料已清除".into();
+                    }
+                });
+
+                if let Some(snap) = self.research_before.as_ref() {
+                    let same = snap.addr == obj && snap.name == cur.name;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "修改前快照：{}　物件 {:#x}　{} bytes{}",
+                            snap.name,
+                            snap.addr,
+                            snap.data.len(),
+                            if same { "" } else { "　⚠ 目前選手不同" }
+                        ))
+                        .small()
+                        .color(if same {
+                            egui::Color32::from_rgb(80, 200, 120)
+                        } else {
+                            egui::Color32::from_rgb(240, 170, 60)
+                        }),
+                    );
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("任意 Offset 讀寫（研究用）").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "相對於目前選手物件讀寫 1 byte。適合驗證差分找到的欄位，例如 +0x002D。\n\
+                         ⚠ 寫錯 offset / 數值可能造成遊戲異常；先載入確認，再一次只改一個 byte。"
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Offset");
+                    ui.add_sized(
+                        [90.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.research_offset_text)
+                            .hint_text("0x002D")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui.button("載入").clicked() {
+                        self.research_load_byte();
+                    }
+                    ui.label("Value (hex)");
+                    ui.add_sized(
+                        [54.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.research_value_text)
+                            .hint_text("00")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let loaded_here = self
+                        .research_loaded_byte
+                        .is_some_and(|(a, _, _)| a == obj);
+                    if ui
+                        .add_enabled(loaded_here, egui::Button::new("寫入 1 byte"))
+                        .on_hover_text("只寫入這個 offset 的 1 byte；切換選手或修改 offset 後必須重新載入。")
+                        .clicked()
+                    {
+                        self.research_write_byte();
+                    }
+                    if let Some((a, off, v)) = self.research_loaded_byte {
+                        if a == obj {
+                            ui.monospace(format!("已載入 +0x{off:04X} = {v:02X}"));
+                        } else {
+                            ui.weak("已切換選手，請重新載入");
+                        }
+                    }
+                });
+
+                if !self.research_diffs.is_empty() {
+                    let shown = self
+                        .research_diffs
+                        .iter()
+                        .filter(|d| {
+                            !self.research_single_bit_only || d.xor.count_ones() == 1
+                        })
+                        .count();
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "差分 {} 個 byte；目前顯示 {} 個",
+                            self.research_diffs.len(),
+                            shown
+                        ))
+                        .strong(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("research_diff_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([10.0, 3.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Offset");
+                                    ui.strong("修改前");
+                                    ui.strong("修改後");
+                                    ui.strong("XOR");
+                                    ui.strong("bit");
+                                    ui.strong("備註");
+                                    ui.end_row();
+                                    for d in &self.research_diffs {
+                                        if self.research_single_bit_only
+                                            && d.xor.count_ones() != 1
+                                        {
+                                            continue;
+                                        }
+                                        let bits = if d.xor.count_ones() == 1 {
+                                            format!("bit{}", d.xor.trailing_zeros())
+                                        } else {
+                                            let mut v = Vec::new();
+                                            for b in 0..8 {
+                                                if d.xor >> b & 1 == 1 {
+                                                    v.push(format!("{b}"));
+                                                }
+                                            }
+                                            format!("bits {}", v.join(","))
+                                        };
+                                        let note = if (OFF_ABIL2..OFF_ABIL2 + ABIL_BYTES)
+                                            .contains(&d.off)
+                                        {
+                                            "既有特殊能力區"
+                                        } else if d.off == OFF_POS || d.off == OFF_POS + 1 {
+                                            "主要守位欄位"
+                                        } else {
+                                            ""
+                                        };
+                                        ui.monospace(format!("+0x{:04X}", d.off));
+                                        ui.monospace(format!("{:02X}", d.before));
+                                        ui.monospace(format!("{:02X}", d.after));
+                                        ui.monospace(format!("{:02X}", d.xor));
+                                        ui.monospace(bits);
+                                        if note.is_empty() {
+                                            ui.label("");
+                                        } else {
+                                            ui.weak(note);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "判讀建議：同一能力換 2～3 位選手重複實驗；固定出現的相同 offset/bit 才值得認定。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+        ui.separator();
+
         // ── 成長經驗值（★ 明星選手模式的能力值真正來源）
         // 只有找得到經驗值結構時才顯示 —— 栄冠模式沒有這東西
         let growth = self.growth_base.filter(|_| self.cur.as_ref().is_some_and(|c| c.addr == obj));
@@ -1301,6 +1812,60 @@ impl App {
                     act = Some((ok, "投手適性（含經驗值）".into()));
                 }
                 ui.end_row();
+
+                // 栄冠：主要守備位置（+0xA30 bit3~6）。
+                // 只改「主要位置」本身，不會自動改下方各守位適性。
+                if self.mode == Mode::Koshien {
+                    ui.label("主要守備位置")
+                        .on_hover_text("栄冠部員一覽與選手標題使用的主要守備位置。\n\
+                                        存在 +0xA30 的 bit3~6；寫入時會保留同一 u16 的其他旗標。\n\
+                                        ※ 只改主要位置，不會自動提高該守位適性；需要時請再調整下方守位適性。");
+                    let old_pos = cur.pos;
+                    egui::ComboBox::from_id_source(("main_pos", obj))
+                        .selected_text(pos_name(cur.pos))
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for (v, name) in POS_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.pos, v as u8, *name);
+                            }
+                        });
+                    if cur.pos != old_pos {
+                        let ok = write_pos(P!(), obj, cur.pos);
+                        if ok {
+                            // 左側清單是 self.list 的快照；同步更新，讓位置圖示與分組立即一致。
+                            if let Some(i) = self.sel {
+                                if let Some(pl) = self.list.get_mut(i) {
+                                    pl.pos = cur.pos;
+                                }
+                            }
+                        }
+                        act = Some((ok, format!("主要守備位置 → {}", pos_name(cur.pos))));
+                    }
+                    ui.end_row();
+                }
+
+                // 栄冠：打擊姿勢。三欄聯合編碼（+0x2C bit7 / +0x2D low2 / +0xFB6 low3）。
+                // 只在栄冠顯示：目前映射只在栄冠球員上完成交叉驗證。
+                if self.mode == Mode::Koshien {
+                    ui.label("打擊姿勢")
+                        .on_hover_text("已實測的 7 種打球型態。選擇後會同步修改：\n\
+                                        +0x2C bit7、+0x2D low2、+0xFB6 low3。\n\
+                                        每一處都只改已確認的 bits，其他旗標（包含捕手配球）會保留。");
+                    let old_style = cur.batting_style;
+                    egui::ComboBox::from_id_source(("batting_style", obj))
+                        .selected_text(batting_style_name(cur.batting_style))
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for (v, name) in BATTING_STYLE_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.batting_style, v as u8, *name);
+                            }
+                        });
+                    if cur.batting_style != old_style && cur.batting_style != BATTING_STYLE_UNKNOWN {
+                        let ok = write_batting_style(P!(), obj, cur.batting_style);
+                        act = Some((ok, format!("打擊姿勢 → {}", batting_style_name(cur.batting_style))));
+                    }
+                    ui.end_row();
+                }
 
                 // 8 個野手守位（+0x18..0x1F）。⚠ 只寫顯示值撐不住 ——
                 // 沒練的守位看起來正常, 一旦在遊戲內練它就會依經驗值被算回 G,
@@ -1476,6 +2041,59 @@ impl App {
                     ui.end_row();
                 }
             });
+
+            // ── 野手風格：已實測確認「打擊積極性／選球眼」G~A，以及「人氣」旗標。
+            // 顯示方式沿用捕手配球的 grade_btn：左鍵升一級，右鍵直接選。
+            if self.mode == Mode::Koshien {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("野手風格").strong());
+                egui::Grid::new("fielder_style").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                    const FIELDER_GRADE_OPTS: [(u8, &str); 7] = [
+                        (0, "G"), (1, "F"), (2, "E"), (3, "D"),
+                        (4, "C"), (5, "B"), (6, "A"),
+                    ];
+
+                    ui.label("打擊積極性")
+                        .on_hover_text(
+                            "栄冠模式實測：G~A（沒有 S）。\n\
+                             顯示等級在 +0xA5B low3，同步值在 +0x10AE low3；\n\
+                             修改時會同步寫兩處，其他 bits 原樣保留。"
+                        );
+                    if let Some(g) = grade_btn(ui, cur.batting_aggression, &FIELDER_GRADE_OPTS, 52.0) {
+                        cur.batting_aggression = g;
+                        let ok = write_batting_aggression(P!(), obj, g);
+                        act = Some((ok, format!("打擊積極性 → {}", FIELDER_GRADE_OPTS[g as usize].1)));
+                    }
+                    ui.end_row();
+
+                    ui.label("選球眼")
+                        .on_hover_text(
+                            "栄冠模式實測：G~A（沒有 S）。\n\
+                             顯示等級在 +0xA53 bit3~5，同步值在 +0x10AA low3；\n\
+                             修改時會同步寫兩處，其他 bits 原樣保留。"
+                        );
+                    if let Some(g) = grade_btn(ui, cur.plate_discipline, &FIELDER_GRADE_OPTS, 52.0) {
+                        cur.plate_discipline = g;
+                        let ok = write_plate_discipline(P!(), obj, g);
+                        act = Some((ok, format!("選球眼 → {}", FIELDER_GRADE_OPTS[g as usize].1)));
+                    }
+                    ui.end_row();
+
+                    ui.label("人氣(投手/野手)")
+                        .on_hover_text(
+                            "栄冠模式實測：+0xA30 low3=1 時沒有人氣，=2 時有人氣。\n\
+                             只修改 low3，主要守備位置所在的 bit3~6 會原樣保留。"
+                        );
+                    let mut popularity = cur.popularity;
+                    if ui.checkbox(&mut popularity, "").changed() {
+                        cur.popularity = popularity;
+                        let ok = write_popularity(P!(), obj, popularity);
+                        act = Some((ok, format!("人氣(投手/野手) → {}", if popularity { "有" } else { "無" })));
+                    }
+                    ui.end_row();
+                });
+            }
 
             ui.add_space(6.0);
             ui.separator();
