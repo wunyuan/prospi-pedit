@@ -1,8 +1,10 @@
-# pedit — プロスピ 單機選手編輯器
+# prospi-pedit — eBaseball PRO SPIRIT 單機選手編輯器
 
-給 Steam 版 **eBaseball パワフルプロ野球 PRO SPIRIT（プロスピ）** 用的選手編輯器。
+> 💡 **Fork 聲明**：本專案 Fork 自 [aa66609/pedit](https://github.com/aa66609/pedit)，特別感謝原作者提供優秀的底層架構與記憶體分析！
 
-不用 Cheat Engine、不用背記憶體位址、不用打指令。**開遊戲 → 開 pedit → 左邊點選手 → 右邊拉滑桿**，改完立刻生效。
+給 Steam 版 **eBaseball パワフルプロ野球 PRO SPIRIT（プロスピ）** 用的圖形介面選手編輯器。
+
+不用 Cheat Engine、不用背記憶體位址、不用打指令。**開遊戲 → 開 prospi-pedit → 左邊點選手 → 右邊拉滑桿**，改完立刻生效。
 
 > **A GUI player editor for the single-player modes of eBaseball PRO SPIRIT (Steam).** Windows x64 only.
 
