@@ -994,36 +994,55 @@ pub fn clear_rec(p: &Proc, obj: usize, idx: usize) -> bool {
 }
 
 // ─────────────────────────────────────────────── 栄冠（高中）指標鏈
+// 2026-08-28 新版：同一個 static root 分成「部員名單」與「道具」兩條鏈。
+pub const KOSHIEN_STATIC: usize = 0x139C5EA0;
 
-pub const KOSHIEN_STATIC: usize = 0x13626518;
-pub const KOSHIEN_COUNT: usize = 0x185448;
-pub const KOSHIEN_ARRAY: usize = 0x185450;
-
-/// 栄冠模式的 mode 物件。離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
+/// 栄冠道具側的 mode 物件：
+/// `[exe+139C5EA0] -> +0x70`。離開該模式時回傳 0 屬正常。
 pub fn koshien_modeobj(p: &Proc) -> usize {
     if p.base == 0 {
         return 0;
     }
-    let l1 = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
-    if l1 == 0 {
+    let root = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
+    if root == 0 {
         return 0;
     }
-    p.u64_at(l1 + 0x70) as usize
+    p.u64_at(root + 0x70) as usize
 }
 
-/// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
+/// 栄冠部員名單 wrapper：
+/// `[exe+139C5EA0] -> +0x60 -> +0x20 -> +0x78 -> +0x08`。
+fn koshien_roster_wrapper(p: &Proc) -> usize {
+    if p.base == 0 {
+        return 0;
+    }
+    let mut o = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
+    if o == 0 { return 0; }
+    for off in [0x60usize, 0x20, 0x78, 0x08] {
+        o = p.u64_at(o + off) as usize;
+        if o == 0 { return 0; }
+    }
+    o
+}
+
+/// 栄冠模式的部員名單。
+/// 新版 roster wrapper 的結構已實機確認：
+///   wrapper +0x08 = 部員數 (count)
+///   wrapper +0x10 = Player Object 指標陣列起點，每格 8 bytes
+/// 例如 count=30 時，+0x08 內容為 0x1E。
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
-    let modeobj = koshien_modeobj(p);
-    if modeobj == 0 {
+    let wrapper = koshien_roster_wrapper(p);
+    if wrapper == 0 {
         return Vec::new();
     }
-    let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
-    if n == 0 || n > 512 {
+
+    let count = p.u64_at(wrapper + 0x08) as usize;
+    if count == 0 || count > 128 {
         return Vec::new();
     }
-    let arr = modeobj + KOSHIEN_ARRAY;
-    (0..n)
-        .map(|i| p.u64_at(arr + i * 8) as usize)
+
+    (0..count)
+        .map(|i| p.u64_at(wrapper + 0x10 + i * 8) as usize)
         .filter(|&o| o != 0)
         .collect()
 }
@@ -1034,8 +1053,8 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
 pub const KOSHIEN_ITEMOBJ: usize = 0x185438;
 /// 栄冠道具是 i32 連續陣列，index ＝ 道具 ID，未持有 ＝ 0（UI 只顯示非零的格子）
 pub const KOSHIEN_ITEM_N: usize = 221;
-/// 跨模式共用道具表（i32 ×49）。**資料位址跨版本沒變**，不必 AOB
-pub const SHARED_ITEMS: usize = 0x1974D280;
+/// 跨模式共用道具表（i32 ×49），2026-08-28 新版已重新驗證 index 0..48。
+pub const SHARED_ITEMS: usize = 0x19AECCE0;
 pub const SHARED_ITEM_N: usize = 49;
 /// 明星選手「道具使用次數」byte 陣列的靜態指標（未進入該模式時會是 0，讀不到屬正常）
 pub const STAR_USE_PTR: usize = 0x195FC798;

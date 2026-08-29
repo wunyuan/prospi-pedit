@@ -205,6 +205,14 @@ enum Mode {
     Star,
 }
 
+/// 栄冠左側名單的顯示方式。
+/// Sorted ＝ 既有的守備位置／能力排序；Raw ＝ roster array 原始 index 順序。
+#[derive(PartialEq, Clone, Copy)]
+enum KoshienRosterView {
+    Sorted,
+    Raw,
+}
+
 /// 能力研究用的選手物件記憶體快照。
 #[derive(Clone)]
 struct ResearchSnapshot {
@@ -226,6 +234,7 @@ struct App {
     proc: Option<Proc>,
     err: String,
     mode: Mode,
+    koshien_roster_view: KoshienRosterView,
     filter: String,
     list: Vec<Player>,
     sel: Option<usize>,
@@ -288,6 +297,7 @@ impl App {
             proc,
             err,
             mode: Mode::Koshien,
+            koshien_roster_view: KoshienRosterView::Sorted,
             filter: String::new(),
             list: Vec::new(),
             sel: None,
@@ -818,6 +828,32 @@ fn player_row(ui: &mut egui::Ui, pl: &Player, sel: bool, copies: usize, star: bo
     .inner
 }
 
+/// 栄冠「原始名單」的一列：保留 roster array 的原始 index，不做任何重新排序。
+/// 左側顯示 #00..、守備位置與姓名；hover 顯示 Player Object 位址。
+fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [34.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("#{index:02}")).monospace().weak()),
+        );
+        ui.add_sized(
+            [30.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
+            ),
+        );
+        let w = ui.available_width().max(40.0);
+        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, &pl.name))
+            .on_hover_text(format!(
+                "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
+                pos_name(pl.pos),
+                pl.addr
+            ))
+            .clicked()
+    })
+    .inner
+}
+
 /// G~S 由低到高（`grade_btn` 的選項表）
 const GS_OPTS: [(u8, &str); 8] = [
     (0, "G"), (1, "F"), (2, "E"), (3, "D"), (4, "C"), (5, "B"), (6, "A"), (7, "S"),
@@ -1143,7 +1179,26 @@ impl eframe::App for App {
             ui.add_space(3.0);
         });
 
-        egui::SidePanel::left("list").resizable(true).default_width(230.0).show(ctx, |ui| {
+        egui::SidePanel::left("list").resizable(true).default_width(250.0).show(ctx, |ui| {
+            // 只有栄冠有固定 roster array，因此只有栄冠提供「排序／原始」兩種頁籤。
+            // 明星選手模式仍維持既有掃描結果顯示，不受此功能影響。
+            if self.mode == Mode::Koshien {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.koshien_roster_view,
+                        KoshienRosterView::Sorted,
+                        "已排序名單",
+                    );
+                    ui.selectable_value(
+                        &mut self.koshien_roster_view,
+                        KoshienRosterView::Raw,
+                        "原始名單",
+                    )
+                    .on_hover_text("完全照遊戲 roster array 的 index 0..N-1 顯示，不依守備位置重新排序");
+                });
+                ui.separator();
+            }
+
             ui.horizontal(|ui| {
                 ui.label("搜尋");
                 ui.text_edit_singleline(&mut self.filter);
@@ -1151,134 +1206,159 @@ impl eframe::App for App {
             // ⚠ 原本是「球速≥120」—— 但野手的球速欄一律是 120，等於完全沒過濾。
             //   改用 +0xEB6 的守備位置。
             ui.checkbox(&mut self.only_pitchers, "只顯示投手");
-            ui.checkbox(&mut self.merge_dups, "合併同名副本")
-                .on_hover_text("同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。\n勾起來時同隊同名只留位址最小的那份，右邊會標「×份數」。\n⚠ 挑哪一份是經驗法則（12 位對照畫面值中 11 位正確），\n　 改了畫面沒反應就取消勾選、換一份試。");
+
+            // 原始名單的目的就是忠實顯示 roster index，因此不套用「合併同名副本」。
+            // 其他模式與栄冠的已排序名單維持既有行為。
+            let raw_koshien = self.mode == Mode::Koshien
+                && self.koshien_roster_view == KoshienRosterView::Raw;
+            if !raw_koshien {
+                ui.checkbox(&mut self.merge_dups, "合併同名副本")
+                    .on_hover_text("同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。\n勾起來時同隊同名只留位址最小的那份，右邊會標「×份數」。\n⚠ 挑哪一份是經驗法則（12 位對照畫面值中 11 位正確），\n　 改了畫面沒反應就取消勾選、換一份試。");
+            } else {
+                ui.weak(format!("Roster 原始順序：{} 人（index 0..{}）",
+                    self.list.len(), self.list.len().saturating_sub(1)));
+            }
             ui.separator();
+
             // auto_shrink=false：否則每列是 horizontal（內容寬），ScrollArea 會跟著縮，
             // 面板右半邊會空一大塊出來
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                 let f = self.filter.trim().to_lowercase();
                 let mut newsel = None;
 
-                // 依守備位置分組（P→C→1B→2B→3B→SS→LF→CF→RF），組內能力高的在前
-                // —— 跟遊戲的部員一覽同一個排法，方便對著畫面找人。
-                // ⚠ 只排「顯示順序」，self.list 不動，否則 self.sel 這個索引會失效。
-                let mut order: Vec<usize> = (0..self.list.len())
-                    .filter(|&i| {
-                        let pl = &self.list[i];
-                        (f.is_empty() || pl.name.to_lowercase().contains(&f))
-                            && !(self.only_pitchers && pl.pos != 0)
-                    })
-                    .collect();
-                order.sort_by_key(|&i| {
-                    let pl = &self.list[i];
-                    // 投手看球速、野手看對右打擊 —— 只在組內比較, 混用不影響
-                    let strength = if pl.pos == 0 { pl.speed as i32 } else { pl.stats[0] as i32 };
-                    (pl.pos, -strength)
-                });
-
-                // ── 合併同名副本：同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。
-                //   同隊同名只留**位址最小**的那份 —— 拿 12 位選手的畫面球速/耐力比對，
-                //   這條規則 11/12 挑到畫面正在讀的那份。
-                // 查 reload 時算好的表, 每幀不做任何記憶體讀取
-                let mut copies: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::new();
-                if self.merge_dups {
-                    order.retain(|&i| {
-                        let pl = &self.list[i];
-                        match self.dup_rep.get(&(pl.team, pl.name.clone())) {
-                            Some(&(rep, n)) if rep == i => {
-                                copies.insert(i, n);
-                                true
-                            }
-                            Some(_) => false,
-                            None => true,
+                if raw_koshien {
+                    // 栄冠原始名單：直接走 self.list 的原始 roster 順序。
+                    // 搜尋／只顯示投手只做「過濾」，絕不改變剩餘項目的 index 或次序。
+                    for (i, pl) in self.list.iter().enumerate() {
+                        if !f.is_empty() && !pl.name.to_lowercase().contains(&f) {
+                            continue;
                         }
-                    });
-                }
-
-                if self.mode == Mode::Koshien {
-                    // 栄冠只有一隊 —— 直接照守備位置分組
-                    let mut last_pos: Option<u8> = None;
-                    for i in order {
-                        if last_pos.is_some_and(|p| p != self.list[i].pos) {
-                            ui.separator();
+                        if self.only_pitchers && pl.pos != 0 {
+                            continue;
                         }
-                        last_pos = Some(self.list[i].pos);
-                        if player_row(ui, &self.list[i], self.sel == Some(i),
-                                      copies.get(&i).copied().unwrap_or(1),
-                                      self.growth_owners.contains(&i)) {
+                        if raw_koshien_player_row(ui, i, pl, self.sel == Some(i)) {
                             newsel = Some(i);
                         }
                     }
                 } else {
-                    // 明星選手：先分隊，隊內再照守備位置（order 已經排好，這裡保持穩定）
-                    let mut by_team: std::collections::BTreeMap<u8, Vec<usize>> =
-                        std::collections::BTreeMap::new();
-                    for &i in &order {
-                        by_team.entry(self.list[i].team).or_default().push(i);
-                    }
-                    for (tid, idxs) in by_team {
-                        // 沒自訂隊名時，把隊上第一位（排序後＝最強的投手）當辨識線索，
-                        // 不然一整排「隊伍 6」根本認不出誰是誰
-                        let label = match self.teams.get(&tid) {
-                            Some(n) => format!("{n}　{} 人", idxs.len()),
-                            None => format!(
-                                "隊伍 {tid}　{} 人　（{}…）",
-                                idxs.len(),
-                                self.list[idxs[0]].name
-                            ),
-                        };
-                        let mut head =
-                            egui::CollapsingHeader::new(label).id_source(("team", tid));
-                        // 搜尋中就全部展開，否則搜到的人會藏在收合的群組裡
-                        if !f.is_empty() {
-                            head = head.open(Some(true));
-                        }
-                        head.show(ui, |ui| {
-                            // 隊名：記憶體裡沒有 ID→隊名的對照表, 讓使用者自己命名並存檔
-                            if self.rename_team == Some(tid) {
-                                let r = ui.text_edit_singleline(&mut self.rename_buf);
-                                let done = r.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                if done || ui.small_button("✔ 儲存").clicked() {
-                                    let v = self.rename_buf.trim().to_string();
-                                    if v.is_empty() {
-                                        self.teams.remove(&tid);
-                                    } else {
-                                        self.teams.insert(tid, v);
-                                    }
-                                    self.rename_team = None;
-                                    self.status = match save_teams(&teams_path(), &self.teams) {
-                                        Ok(()) => format!("已存隊名 → {}", teams_path().display()),
-                                        Err(e) => e,
-                                    };
+                    // 既有顯示方式：依守備位置分組（P→C→1B→2B→3B→SS→LF→CF→RF），
+                    // 組內能力高的在前。只排序 UI 的 order，self.list 原始順序永遠不動。
+                    let mut order: Vec<usize> = (0..self.list.len())
+                        .filter(|&i| {
+                            let pl = &self.list[i];
+                            (f.is_empty() || pl.name.to_lowercase().contains(&f))
+                                && !(self.only_pitchers && pl.pos != 0)
+                        })
+                        .collect();
+                    order.sort_by_key(|&i| {
+                        let pl = &self.list[i];
+                        let strength = if pl.pos == 0 { pl.speed as i32 } else { pl.stats[0] as i32 };
+                        (pl.pos, -strength)
+                    });
+
+                    let mut copies: std::collections::HashMap<usize, usize> =
+                        std::collections::HashMap::new();
+                    if self.merge_dups {
+                        order.retain(|&i| {
+                            let pl = &self.list[i];
+                            match self.dup_rep.get(&(pl.team, pl.name.clone())) {
+                                Some(&(rep, n)) if rep == i => {
+                                    copies.insert(i, n);
+                                    true
                                 }
-                            } else {
-                                let hint = &self.list[idxs[0]].name;
-                                if ui
-                                    .small_button(format!("✎ 命名（例如：{hint} 那一隊）"))
-                                    .on_hover_text(
-                                        "遊戲記憶體裡沒有隊伍 ID 對隊名的表, \
-                                         所以隊名要自己填一次, 之後會記在 teams.json。",
-                                    )
-                                    .clicked()
-                                {
-                                    self.rename_team = Some(tid);
-                                    self.rename_buf =
-                                        self.teams.get(&tid).cloned().unwrap_or_default();
-                                }
-                            }
-                            for &i in &idxs {
-                                if player_row(ui, &self.list[i], self.sel == Some(i),
-                                      copies.get(&i).copied().unwrap_or(1),
-                                      self.growth_owners.contains(&i)) {
-                                    newsel = Some(i);
-                                }
+                                Some(_) => false,
+                                None => true,
                             }
                         });
                     }
+
+                    if self.mode == Mode::Koshien {
+                        let mut last_pos: Option<u8> = None;
+                        for i in order {
+                            if last_pos.is_some_and(|p| p != self.list[i].pos) {
+                                ui.separator();
+                            }
+                            last_pos = Some(self.list[i].pos);
+                            if player_row(
+                                ui,
+                                &self.list[i],
+                                self.sel == Some(i),
+                                copies.get(&i).copied().unwrap_or(1),
+                                self.growth_owners.contains(&i),
+                            ) {
+                                newsel = Some(i);
+                            }
+                        }
+                    } else {
+                        // 明星選手：完全維持原本的「先分隊、隊內依守備位置」顯示方式。
+                        let mut by_team: std::collections::BTreeMap<u8, Vec<usize>> =
+                            std::collections::BTreeMap::new();
+                        for &i in &order {
+                            by_team.entry(self.list[i].team).or_default().push(i);
+                        }
+                        for (tid, idxs) in by_team {
+                            let label = match self.teams.get(&tid) {
+                                Some(n) => format!("{n}　{} 人", idxs.len()),
+                                None => format!(
+                                    "隊伍 {tid}　{} 人　（{}…）",
+                                    idxs.len(),
+                                    self.list[idxs[0]].name
+                                ),
+                            };
+                            let mut head =
+                                egui::CollapsingHeader::new(label).id_source(("team", tid));
+                            if !f.is_empty() {
+                                head = head.open(Some(true));
+                            }
+                            head.show(ui, |ui| {
+                                if self.rename_team == Some(tid) {
+                                    let r = ui.text_edit_singleline(&mut self.rename_buf);
+                                    let done = r.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if done || ui.small_button("✔ 儲存").clicked() {
+                                        let v = self.rename_buf.trim().to_string();
+                                        if v.is_empty() {
+                                            self.teams.remove(&tid);
+                                        } else {
+                                            self.teams.insert(tid, v);
+                                        }
+                                        self.rename_team = None;
+                                        self.status = match save_teams(&teams_path(), &self.teams) {
+                                            Ok(()) => format!("已存隊名 → {}", teams_path().display()),
+                                            Err(e) => e,
+                                        };
+                                    }
+                                } else {
+                                    let hint = &self.list[idxs[0]].name;
+                                    if ui
+                                        .small_button(format!("✎ 命名（例如：{hint} 那一隊）"))
+                                        .on_hover_text(
+                                            "遊戲記憶體裡沒有隊伍 ID 對隊名的表, \
+                                             所以隊名要自己填一次, 之後會記在 teams.json。",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.rename_team = Some(tid);
+                                        self.rename_buf =
+                                            self.teams.get(&tid).cloned().unwrap_or_default();
+                                    }
+                                }
+                                for &i in &idxs {
+                                    if player_row(
+                                        ui,
+                                        &self.list[i],
+                                        self.sel == Some(i),
+                                        copies.get(&i).copied().unwrap_or(1),
+                                        self.growth_owners.contains(&i),
+                                    ) {
+                                        newsel = Some(i);
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
+
                 if let Some(i) = newsel {
                     self.sel = Some(i);
                     self.reload_current();
@@ -1332,7 +1412,17 @@ impl App {
                     .unwrap_or_else(|| format!("隊伍 {}", cur.team));
                 ui.label(t);
             }
-            ui.label(format!("物件 {obj:#x}"));
+            // 選中任何球員後都直接顯示實際 Player Object 位址。
+            // 栄冠模式下 self.sel 仍是原始 roster array 的索引，即使左側目前採守備位置排序。
+            if self.mode == Mode::Koshien {
+                if let Some(i) = self.sel {
+                    ui.monospace(format!("Roster #{i:02}  |  Player Object: 0x{obj:X}"));
+                } else {
+                    ui.monospace(format!("Player Object: 0x{obj:X}"));
+                }
+            } else {
+                ui.monospace(format!("Player Object: 0x{obj:X}"));
+            }
             if ui.button("重新讀取").clicked() {
                 act = Some((true, "（重新讀取）".into()));
             }
