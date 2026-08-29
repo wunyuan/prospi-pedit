@@ -936,6 +936,7 @@ impl Player {
             batting_aggression: u8a(OFF_BATTING_AGGRESSION) & 7,
             plate_discipline: (u8a(OFF_PLATE_DISCIPLINE) >> PLATE_DISCIPLINE_SHIFT) & 7,
             popularity: (u8a(OFF_POPULARITY) & POPULARITY_MASK) == POPULARITY_ON,
+            // 第三個參數是副本, 傳進去但不參與判斷（見 batting_style_from_raw）
             batting_style: batting_style_from_raw(u8a(OFF_CATCH), u8a(OFF_BATTING_STYLE), u8a(OFF_BATTING_SYNC))
                 .unwrap_or(BATTING_STYLE_UNKNOWN),
             team: u8a(OFF_TEAM),
@@ -2514,6 +2515,10 @@ pub const OFF_BATTING_STYLE: usize = 0x2D;
 
 /// 打擊姿勢同步欄位：`+0xFB6` 的 low 3 bits。
 /// 目前只確認 0..6；其餘 high bits 保留，避免破壞未知旗標。
+/// ⚠ **彈道的副本，遊戲既不讀也不回寫** —— 保留只為了記下「這裡有一份」。
+/// 2026-08-29 實測確認（見 [`write_batting_style`]）。副本區的偏移規律是 `+0x114`
+/// （`0xE90`→`0xFA4`、`0xEA0`→`0xFB4`），`0xFB6` 就在捕手配球副本的隔壁。
+/// **不要拿它判讀，也不要寫它。**
 pub const OFF_BATTING_SYNC: usize = 0xFB6;
 
 pub const BATTING_STYLE_UNKNOWN: u8 = 0xFF;
@@ -2539,16 +2544,31 @@ pub fn batting_style_name(v: u8) -> &'static str {
 }
 
 /// 從三個實際欄位判定目前打擊姿勢；不認識的組合回 None。
-pub fn batting_style_from_raw(c2c: u8, c2d: u8, fb6: u8) -> Option<u8> {
-    let key = (c2c & 0x80 != 0, c2d & 0x03, fb6 & 0x07);
-    BATTING_STYLE_RAW.iter().position(|&x| x == key).map(|i| i as u8)
+/// ⚠ **只看 `0x2C` bit7 與 `0x2D` low2，`fb6` 參數保留但不參與判斷。**
+///
+/// 2026-08-29 實測：只寫 `0x2D`（`0xFB6` 故意不動）→ 遊戲畫面就變了，
+/// 而且事後回讀 `0xFB6` **仍是舊值**，遊戲並沒有回寫同步它。
+/// 那兩欄的 7 種組合本來就互不重複，足以單獨決定彈道。
+///
+/// 拿 `fb6` 一起比對會有實害：外部只改了 `0x2D` 時，三元組會落在表外
+/// → 回傳 None → UI 顯示「未知組合」，但遊戲其實已經生效了。
+pub fn batting_style_from_raw(c2c: u8, c2d: u8, _fb6: u8) -> Option<u8> {
+    let key = (c2c & 0x80 != 0, c2d & 0x03);
+    BATTING_STYLE_RAW.iter().position(|&(b, d, _)| (b, d) == key).map(|i| i as u8)
 }
 
-/// 寫入栄冠打擊姿勢。
-/// +0x2C 只動 bit7（bit4~6 是捕手配球）；+0x2D 只動 low2；+0xFB6 只動 low3。
-/// 三欄都採 read-modify-write，保留各自未確認的其他 bits。
+/// 寫入彈道（弾道）。`+0x2C` 只動 bit7（bit4~6 是捕手配球）、`+0x2D` 只動 low2，
+/// 兩欄都是 read-modify-write，保留各自未確認的其他 bits。
+///
+/// ⚠ **不寫 `+0xFB6`。** 2026-08-29 兩位選手交叉實測：
+/// 毛利只寫 `0x2D`（`0xFB6` 保持 0）、中尾三處都寫，**兩人的畫面都正確改變**，
+/// 而且毛利的 `0xFB6` 事後回讀仍是 0 —— 遊戲既不讀它、也不回寫它。
+///
+/// `0xFB6` 落在已知的副本區（`0xE90`→`0xFA4`、`0xEA0`→`0xFB4` 都是 `+0x114`，
+/// 而 `0xFB6` 就在捕手配球副本 `0xFB4` 隔壁）。寫副本沒有作用，
+/// 而本專案已經在副本上栽過五次，沒必要多碰一個已知的副本位址。
 pub fn write_batting_style(p: &Proc, obj: usize, style: u8) -> bool {
-    let Some(&(bit7, d, sync)) = BATTING_STYLE_RAW.get(style as usize) else {
+    let Some(&(bit7, d, _sync)) = BATTING_STYLE_RAW.get(style as usize) else {
         return false;
     };
 
@@ -2558,12 +2578,7 @@ pub fn write_batting_style(p: &Proc, obj: usize, style: u8) -> bool {
     let c2d = p.u8_at(obj + OFF_BATTING_STYLE);
     let n2d = (c2d & !0x03) | (d & 0x03);
 
-    let cfb6 = p.u8_at(obj + OFF_BATTING_SYNC);
-    let nfb6 = (cfb6 & !0x07) | (sync & 0x07);
-
-    p.write(obj + OFF_CATCH, &[n2c])
-        && p.write(obj + OFF_BATTING_STYLE, &[n2d])
-        && p.write(obj + OFF_BATTING_SYNC, &[nfb6])
+    p.write(obj + OFF_CATCH, &[n2c]) && p.write(obj + OFF_BATTING_STYLE, &[n2d])
 }
 
 /// 捕手配球（G~S）＝ `+0x2C` 的 **bit4~6**（3 bits，0=G … 7=S）。
