@@ -235,6 +235,10 @@ struct App {
     err: String,
     mode: Mode,
     koshien_roster_view: KoshienRosterView,
+    /// 榮冠 roster 尚未出現時，每 1 秒重試一次。
+    last_koshien_retry: std::time::Instant,
+    /// roster 已取得後，每 5 秒做一次輕量有效性檢查。
+    last_koshien_validate: std::time::Instant,
     filter: String,
     list: Vec<Player>,
     sel: Option<usize>,
@@ -298,6 +302,8 @@ impl App {
             err,
             mode: Mode::Koshien,
             koshien_roster_view: KoshienRosterView::Sorted,
+            last_koshien_retry: std::time::Instant::now(),
+            last_koshien_validate: std::time::Instant::now(),
             filter: String::new(),
             list: Vec::new(),
             sel: None,
@@ -367,6 +373,74 @@ impl App {
                 false
             }
         }
+    }
+
+    /// 榮冠新版 roster 的 +0x20 child pointer 會隨遊戲畫面狀態切換。
+    /// 因此修改器若比球員名單更早啟動，第一次讀不到 roster 是正常狀況。
+    ///
+    /// - 尚未取得名單：每 1 秒重試，成功後停止高頻重試。
+    /// - 已取得名單：每 5 秒確認 roster pointer / 姓名仍有效。
+    /// - 遊戲重開或 Player Object 搬家：自動重新附加／重新載入。
+    fn auto_refresh_koshien(&mut self, ctx: &egui::Context) {
+        if self.mode != Mode::Koshien {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+
+        if self.list.is_empty() {
+            if now.duration_since(self.last_koshien_retry) >= std::time::Duration::from_secs(1) {
+                self.last_koshien_retry = now;
+                self.reload_list();
+                if !self.list.is_empty() {
+                    self.status = format!("已自動取得榮冠部員名單（{} 人）", self.list.len());
+                }
+            }
+            // 即使視窗沒有輸入事件，也要讓下一次自動重試能準時執行。
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+
+        if now.duration_since(self.last_koshien_validate) < std::time::Duration::from_secs(5) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            return;
+        }
+        self.last_koshien_validate = now;
+
+        // 遊戲真正重開：舊 handle 已失效，直接走 reload_list()，其中 ensure_proc() 會重新附加。
+        if !self.proc_alive() {
+            self.reload_list();
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+
+        let needs_reload = match &self.proc {
+            Some(p) => {
+                let objs = koshien_roster(p);
+                if objs.is_empty() {
+                    // 可能只是暫時離開 roster 有效畫面。保留現有清單，不要讓 UI 閃成空白。
+                    false
+                } else {
+                    let pointers_changed = objs.len() != self.list.len()
+                        || objs.iter().zip(self.list.iter()).any(|(&a, pl)| a != pl.addr);
+                    let first_name_changed = objs.first().is_some_and(|&a| {
+                        let live = read_name(p, a);
+                        self.list.first().is_some_and(|pl| live != pl.name || !sane_name(&live))
+                    });
+                    pointers_changed || first_name_changed
+                }
+            }
+            None => true,
+        };
+
+        if needs_reload {
+            self.reload_list();
+            if !self.list.is_empty() {
+                self.status = format!("偵測到榮冠名單更新，已自動重新載入（{} 人）", self.list.len());
+            }
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_secs(5));
     }
 
     fn reload_list(&mut self) {
@@ -969,6 +1043,7 @@ fn grade_of(v: u8) -> &'static str {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.poll_scan(ctx);
+        self.auto_refresh_koshien(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
