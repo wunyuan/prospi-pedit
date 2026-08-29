@@ -112,6 +112,9 @@ fn spawn_cheat_worker(c: Arc<Cheats>) {
                     if c.shared_items.load(Ordering::Relaxed) {
                         set_shared_items(p, 99);
                     }
+                    if c.star_items.load(Ordering::Relaxed) {
+                        clear_star_item_uses(p);
+                    }
                     if c.lock_player.load(Ordering::Relaxed) {
                         apply_lock(p, &c);
                     }
@@ -234,11 +237,6 @@ struct App {
     only_pitchers: bool,
     /// 成長經驗值要練到幾（0..99）。不是無腦灌滿, 可以指定
     growth_target: i32,
-    /// 道具 patch 指令的位址。**AOB 掃 869MB 程式碼段, 絕對不能每幀做** ——
-    /// 找到一次就快取, 之後只讀那 2 bytes 判斷狀態。
-    /// （2026-08-01 就是把它放在每幀執行的地方, UI 直接卡死。）
-    item_patch_addr: Option<usize>,
-    item_patch_scanned: bool,
     /// 目前選中選手的成長經驗值結構（在 reload_current 時算好, 不要每幀重算）
     growth_base: Option<usize>,
     cheats: Arc<Cheats>,
@@ -274,8 +272,6 @@ impl App {
             cross_dir: false,
             only_pitchers: false,
             growth_target: 99,
-            item_patch_addr: None,
-            item_patch_scanned: false,
             growth_base: None,
             cheats: Arc::new(Cheats::default()),
         };
@@ -300,6 +296,10 @@ impl App {
             return true;
         }
         let old = self.proc.take().map(|p| p.pid);
+        // AOB 快取是以 pid 為 key，但遊戲重開後湊巧拿到同一個 pid 就會沿用舊結果。
+        // 重新附加本來就不在每幀路徑上，多掃一次很便宜。
+        koshien_cache_clear();
+        roster_cache_clear();
         match Proc::attach() {
             Ok(p) => {
                 self.status = match old {
@@ -663,7 +663,6 @@ impl eframe::App for App {
                 //   （只是 handle 指向死掉的 pid），使用者會找不到重新附加的入口。
                 if ui.button("重新附加").clicked() {
                     self.proc = None;
-                    self.item_patch_scanned = false; // 遊戲重開後程式碼位址會變, 快取作廢
                     self.growth_base = None;
                     self.reload_list();
                 }
@@ -776,48 +775,12 @@ impl eframe::App for App {
                      ⚠ 要在栄冠模式（有部員名單的畫面）才有效。");
                 cheat_box(ui, &self.cheats.shared_items,
                     "跨模式：共用道具全 99",
-                    "exe+1974D280 的 i32×49，含栄冠 UI 最後 11 格與明星選手的 7 種。\n\
-                     這是靜態位址，跨版本沒變過，任何模式都能寫。");
-                // ⚠ 這個不是「持續重寫」而是 code patch —— 按一次就永久生效（直到遊戲重開）,
-                //   所以做成按鈕而不是勾選框。舊版走 clear_star_item_uses（靜態指標）已失效。
-                {
-                    // ⚠ AOB 掃 869MB —— 只在第一次（或按過按鈕後）掃, 之後讀快取位址的 2 bytes
-                    if !self.item_patch_scanned {
-                        self.item_patch_addr =
-                            self.proc.as_ref().and_then(|p| find_code(p, ITEM_INC_AOB));
-                        self.item_patch_scanned = true;
-                    }
-                    let patched = match (self.proc.as_ref(), self.item_patch_addr) {
-                        (Some(p), Some(a)) => p.read(a, 2).map(|b| b == [0x90, 0x90]),
-                        _ => None,
-                    };
-                    let label = match patched {
-                        Some(true) => "明星選手：道具使用不消耗　✔ 生效中",
-                        Some(false) => "明星選手：道具使用不消耗",
-                        None => "明星選手：道具使用不消耗（找不到指令）",
-                    };
-                    if ui.button(label)
-                        .on_hover_text(
-                            "把 exe+5B957A1 的 `inc al` nop 掉 —— 使用次數永遠停在 0,\n\
-                             所以用了道具也不會變成 1/10。\n\
-                             ⚠ 這是 code patch, 按一次就好, 不必持續套用;\n\
-                             　 遊戲重開後會消失, 要再按一次。\n\
-                             ⚠ 這條是通用計數器（index 夾 0..271）, nop 掉會讓\n\
-                             　 所有走這條路的計數都不增加, 不只道具。再按一次可還原。")
-                        .clicked()
-                    {
-                        let on = patched != Some(true);
-                        let ok = match (self.proc.as_ref(), self.item_patch_addr) {
-                            (Some(p), Some(a)) => {
-                                p.write_code(a, if on { &[0x90, 0x90] } else { &[0xFE, 0xC0] })
-                            }
-                            _ => false,
-                        };
-                        self.status = format!("道具使用不消耗 → {}：{}",
-                                              if on { "開" } else { "還原" },
-                                              if ok { "ok" } else { "失敗" });
-                    }
-                }
+                    "i32×49，含栄冠 UI 最後 11 格與明星選手的 7 種，任何模式都能寫。\n\
+                     ⚠ 這個靜態位址**會隨版本搬家**（2026-08-27 更新從 exe+1974D280 \
+                     搬到 exe+19AECCE0）——lib 端列了候選並用值域驗證，會自動挑有效的那個。");
+                cheat_box(ui, &self.cheats.star_items,
+                    "明星選手：道具使用次數保持 0",
+                    "把使用次數陣列的道具區間（index 3..9）持續歸零 ——                      UI 的「已使用 N」讀的就是它，所以永遠是 0 ＝ 無限使用。\n                     2026-08-29 用 pscan xref 從計數函式往回追到靜態指標 exe+1999C138，                     已在遊戲畫面驗證過因果（清 0 後 UI 跟著變 0）。\n                     ⚠ 要在明星選手模式（讀過存檔）才有效。\n                     ★ 這取代了舊的「nop 掉 inc al」——那條是通用計數器，                     xref 查出有 18 個呼叫端，nop 掉會波及無關的計數。");
             });
             // 值本身一天才減 1，不勾也行 —— 但觸發經理事件時遊戲會夾回 99，
             // 所以「按一次」只適合之後不再觸發的情況，兩種都留給使用者選。

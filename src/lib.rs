@@ -295,6 +295,40 @@ pub fn find_code(p: &Proc, pat_str: &str) -> Option<usize> {
     None
 }
 
+/// 同 `find_code`，但回傳**所有**命中位址。
+///
+/// 定位 singleton getter 時必須用這個 —— `mov rax,[rip+X]/mov rax,[rax+0x70]`
+/// 這種通用樣式在程式碼段會有數個命中（實測 2 個），
+/// 只取第一個會挑到別的 getter。
+pub fn find_code_all(p: &Proc, pat_str: &str) -> Vec<usize> {
+    const CHUNK: usize = 64 << 20;
+    let pat: Vec<Option<u8>> = pat_str
+        .split_whitespace()
+        .map(|t| if t.starts_with('?') { None } else { u8::from_str_radix(t, 16).ok() })
+        .collect();
+    let mut out = Vec::new();
+    if pat.is_empty() {
+        return out;
+    }
+    for (b, sz) in p.exec_ranges() {
+        let mut off = 0usize;
+        while off < sz {
+            let n = (sz - off).min(CHUNK + pat.len());
+            if let Some(buf) = p.read(b + off, n) {
+                if buf.len() >= pat.len() {
+                    for q in 0..=buf.len() - pat.len() {
+                        if pat.iter().enumerate().all(|(i, x)| x.map_or(true, |v| buf[q + i] == v)) {
+                            out.push(b + off + q);
+                        }
+                    }
+                }
+            }
+            off += CHUNK;
+        }
+    }
+    out
+}
+
 /// 道具使用次數是否已被 nop（＝無限使用）
 pub fn item_use_patched(p: &Proc) -> Option<bool> {
     let a = find_code(p, ITEM_INC_AOB)?;
@@ -978,35 +1012,268 @@ pub fn clear_rec(p: &Proc, obj: usize, idx: usize) -> bool {
 
 // ─────────────────────────────────────────────── 栄冠（高中）指標鏈
 
-pub const KOSHIEN_STATIC: usize = 0x13626518;
+/// 栄冠 singleton 的靜態位址，**新的在前**。
+///
+/// 2026-08-29 的遊戲更新（exe 632MB → 662MB）只搬動了這個位址，
+/// `+0x70` 以下的整條鏈與 modeobj 內部 offset **全部沒變** ——
+/// 一度誤判成「名單改成 vector、結構全變了」，其實是找錯了物件。
+///
+/// | 版本 | 靜態位址 |
+/// |---|---|
+/// | 2026-08-27 更新後 | `exe+139C5EA0` |
+/// | 更新前 | `exe+13626518` |
+///
+/// 逐一驗證（讀到合法的部員數＋姓名才算數），所以多列幾個不會有副作用。
+pub const KOSHIEN_STATIC_CANDS: [usize; 2] = [0x139C5EA0, 0x13626518];
+/// 相容用：等於候選清單的第一個。
+pub const KOSHIEN_STATIC: usize = KOSHIEN_STATIC_CANDS[0];
 pub const KOSHIEN_COUNT: usize = 0x185448;
 pub const KOSHIEN_ARRAY: usize = 0x185450;
+
+/// 栄冠 singleton getter 的指令樣式：`mov rax,[rip+disp32]` ＋ `mov rax,[rax+0x70]`。
+///
+/// **為什麼不寫死靜態位址**：程式碼位址與模組內資料位址都會隨版本偏移，而且
+/// 偏移量彼此不一致（2026-08-29 實測三條 AOB 分別是 +0x5A390 / +0x5F65B / +0x62110）。
+/// 靠 getter 指令的 disp32 反算，等於讓遊戲自己告訴我們位址在哪，跨版本自動跟上。
+pub const KOSHIEN_GETTER_AOB: &str = "48 8B 05 ?? ?? ?? ?? 48 8B 40 70";
+
+/// 解析 `mov rax,[rip+disp32]`（7 bytes）指到的絕對位址。
+fn rip_target(p: &Proc, insn: usize) -> Option<usize> {
+    let b = p.read(insn, 7)?;
+    let disp = i32::from_le_bytes([b[3], b[4], b[5], b[6]]) as i64;
+    let t = insn as i64 + 7 + disp;
+    if t <= 0 { None } else { Some(t as usize) }
+}
+
+/// AOB 掃描結果的快取。key ＝ pid（遊戲重開換 pid 就重掃）。
+///
+/// ⚠ **這個快取是必要的，不是最佳化**：掃描要跑過 900MB 的程式碼段，
+/// 而 `koshien_modeobj()` 在 pedit 裡是每幀路徑上的呼叫
+/// （2026-08-01 已經踩過一次「AOB 進每幀路徑 → UI 卡死」）。
+/// 候選清單不需要進入栄冠模式就能建立，所以掃一次就能一直用；
+/// **驗證留到讀取時做**（純讀幾個 qword，很便宜）。
+static KOSHIEN_CAND: std::sync::Mutex<Option<(u32, Vec<usize>)>> =
+    std::sync::Mutex::new(None);
+
+/// 栄冠 singleton 的靜態位址**候選清單**（AOB 每個 pid 只掃一次）。
+///
+/// 舊的寫死位址排在最前面 —— 萬一哪天又能用，就省掉一次掃描。
+pub fn koshien_static_candidates(p: &Proc) -> Vec<usize> {
+    if p.base == 0 {
+        return Vec::new();
+    }
+    let mut g = KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((pid, v)) = g.as_ref() {
+        if *pid == p.pid {
+            return v.clone();
+        }
+    }
+    // 只收落在**主模組**裡的目標。`exec_ranges()` 連 ntdll/kernel32 一起掃，
+    // 那些模組的同樣式指令會解析出 0x7ffe... 之類的位址，全是雜訊。
+    // 遊戲 exe 實測 662MB，這裡放寬到 768MB。
+    const MODULE_SPAN: usize = 0x3000_0000;
+    let in_module = |t: usize| t > p.base && t < p.base + MODULE_SPAN;
+    let mut v: Vec<usize> = KOSHIEN_STATIC_CANDS.iter().map(|o| p.base + o).collect();
+    for insn in find_code_all(p, KOSHIEN_GETTER_AOB) {
+        if !in_module(insn) {
+            continue;
+        }
+        if let Some(t) = rip_target(p, insn) {
+            if in_module(t) && !v.contains(&t) {
+                v.push(t);
+            }
+        }
+    }
+    *g = Some((p.pid, v.clone()));
+    v
+}
+
+/// 清掉 AOB 快取（「重新附加」時呼叫）。
+pub fn koshien_cache_clear() {
+    *KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// modeobj 的合理性檢查：部員數要在 1..=512，而且第一位部員讀得出合法姓名。
+///
+/// getter 樣式在程式碼段不只一個命中（實測 2 個），光靠「指標非 0」分不出來 ——
+/// 一定要往下讀到**姓名**才算數。
+fn koshien_modeobj_valid(p: &Proc, m: usize) -> bool {
+    if m < 0x10000 {
+        return false;
+    }
+    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
+    if n == 0 || n > 512 {
+        return false;
+    }
+    let first = p.u64_at(m + KOSHIEN_ARRAY) as usize;
+    if first < 0x10000 {
+        return false;
+    }
+    sane_name(&read_name(p, first))
+}
 
 /// 栄冠模式的 mode 物件。離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
 pub fn koshien_modeobj(p: &Proc) -> usize {
     if p.base == 0 {
         return 0;
     }
-    let l1 = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
-    if l1 == 0 {
+    for st in koshien_static_candidates(p) {
+        let l1 = p.u64_at(st) as usize;
+        if l1 < 0x10000 {
+            continue;
+        }
+        let m = p.u64_at(l1 + 0x70) as usize;
+        if koshien_modeobj_valid(p, m) {
+            return m;
+        }
+    }
+    // 指標鏈失效時，用 `koshien_roster()` 掃描留下的結果 —— 道具數量與
+    // 練習效果提升都掛在 modeobj 上，這樣它們也跟著一起救回來。
+    // ⚠ 這裡**只讀快取、不觸發掃描**（本函式在 pedit 是每幀路徑）。
+    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some((pid, Some(m))) = cached {
+        if pid == p.pid && koshien_modeobj_valid(p, m) {
+            return m;
+        }
+    }
+    0
+}
+
+// ─────────────────── 栄冠部員名單：vector 特徵掃描（2026-08-29 遊戲更新後改用）
+
+/// 一個位址看起來像不像遊戲堆積上的物件。
+fn plausible_heap(a: usize) -> bool {
+    (0x1000_0000..0x2_0000_0000).contains(&a) && a % 8 == 0
+}
+
+/// 這個位址是不是一個合法的**選手物件**（姓名 ＋ 8 項能力 ＋ 球種簽章都要過）。
+fn looks_like_player(p: &Proc, obj: usize) -> bool {
+    if !plausible_heap(obj) {
+        return false;
+    }
+    let Some(raw) = p.read(obj, PLAYER_READ) else { return false };
+    if !ball_sig_ok(&raw[OFF_BALL..OFF_BALL + 36]) {
+        return false;
+    }
+    if !raw[OFF_STATS..OFF_STATS + 8].iter().all(|&v| (1..=127).contains(&v)) {
+        return false;
+    }
+    sane_name(&name_from(&raw))
+}
+
+/// 栄冠部員名單的上限。實測一隊 30 人，放寬到 64。
+const ROSTER_MAX: usize = 64;
+
+/// 掃描找出栄冠的 `modeobj`（指標鏈失效時的逃生口）。
+///
+/// **判準是零成本的**：部員名單陣列的正前方 8 bytes 就是
+/// `KOSHIEN_COUNT`（部員數 i32），而 `KOSHIEN_ARRAY = KOSHIEN_COUNT + 8`。
+/// 所以只要在同一個 buffer 裡看「這個 i32 是不是等於後面連續合法指標的個數」，
+/// 完全不必額外讀記憶體就能篩掉幾乎所有位置，通過的才去驗選手簽章。
+///
+/// 為什麼要找 modeobj 而不是只找名單：道具數量、練習效果提升天數
+/// 全都掛在 `modeobj + KOSHIEN_ITEMOBJ` 上，拿到 modeobj 等於整組功能一起救回來。
+///
+/// ⚠ 這支要掃全記憶體（實測 30 秒），**絕對不可以放進每幀路徑**。
+pub fn find_koshien_modeobj(p: &Proc) -> Option<usize> {
+    const CHUNK: usize = 64 << 20;
+    for (base, size) in p.writable_ranges() {
+        let mut off = 0usize;
+        while off < size {
+            let want = (size - off).min(CHUNK + ROSTER_MAX * 8 + 16);
+            if let Some(buf) = p.read(base + off, want) {
+                let rd = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) as usize;
+                let mut q = 8usize;
+                while q + 8 <= buf.len() {
+                    let n = u32::from_le_bytes(buf[q - 8..q - 4].try_into().unwrap()) as usize;
+                    q += 8;
+                    if n == 0 || n > ROSTER_MAX || q - 8 + n * 8 > buf.len() {
+                        continue;
+                    }
+                    let start = q - 8;
+                    if !(0..n).all(|i| plausible_heap(rd(start + i * 8))) {
+                        continue;
+                    }
+                    // 只驗前兩格 —— 不是名單的話這裡幾乎一定掛掉
+                    if !(0..n.min(2)).all(|i| looks_like_player(p, rd(start + i * 8))) {
+                        continue;
+                    }
+                    if !(0..n).all(|i| looks_like_player(p, rd(start + i * 8))) {
+                        continue;
+                    }
+                    return Some((base + off + start).wrapping_sub(KOSHIEN_ARRAY));
+                }
+            }
+            off += CHUNK;
+        }
+    }
+    None
+}
+
+/// 掃描找到的 modeobj 快取，以及「這個 pid 已經掃過了」的記號。
+///
+/// 掃描要 30 秒，**每個 pid 只能掃一次** —— 否則指標鏈壞掉時，
+/// 每次重新整理都會重掃一遍，UI 等於整個卡死。
+static MODEOBJ_SCAN: std::sync::Mutex<Option<(u32, Option<usize>)>> =
+    std::sync::Mutex::new(None);
+
+/// 清掉掃描快取（「重新附加」時呼叫）。
+pub fn roster_cache_clear() {
+    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+/// 指標鏈失效時的逃生口：掃描找 modeobj，結果（含失敗）依 pid 快取。
+pub fn koshien_modeobj_scanned(p: &Proc) -> usize {
+    if p.base == 0 {
         return 0;
     }
-    p.u64_at(l1 + 0x70) as usize
+    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some((pid, r)) = cached {
+        if pid == p.pid {
+            // 物件會搬家，所以用之前先驗一次；失效就重掃
+            if let Some(m) = r {
+                if koshien_modeobj_valid(p, m) {
+                    return m;
+                }
+            } else {
+                return 0;
+            }
+        }
+    }
+    let r = find_koshien_modeobj(p);
+    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.pid, r));
+    r.unwrap_or(0)
 }
 
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
+///
+/// 先走舊的靜態指標鏈（快），壞掉才退回 vector 掃描並快取結果。
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
     let modeobj = koshien_modeobj(p);
-    if modeobj == 0 {
+    if modeobj != 0 {
+        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
+        if n > 0 && n <= 512 {
+            let arr = modeobj + KOSHIEN_ARRAY;
+            let v: Vec<usize> = (0..n)
+                .map(|i| p.u64_at(arr + i * 8) as usize)
+                .filter(|&o| o != 0)
+                .collect();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    // 指標鏈失效 —— 掃描找 modeobj（每個 pid 只掃一次）
+    let m = koshien_modeobj_scanned(p);
+    if m == 0 {
         return Vec::new();
     }
-    let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
+    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
     if n == 0 || n > 512 {
         return Vec::new();
     }
-    let arr = modeobj + KOSHIEN_ARRAY;
     (0..n)
-        .map(|i| p.u64_at(arr + i * 8) as usize)
+        .map(|i| p.u64_at(m + KOSHIEN_ARRAY + i * 8) as usize)
         .filter(|&o| o != 0)
         .collect()
 }
@@ -1018,13 +1285,68 @@ pub const KOSHIEN_ITEMOBJ: usize = 0x185438;
 /// 栄冠道具是 i32 連續陣列，index ＝ 道具 ID，未持有 ＝ 0（UI 只顯示非零的格子）
 pub const KOSHIEN_ITEM_N: usize = 221;
 /// 跨模式共用道具表（i32 ×49）。**資料位址跨版本沒變**，不必 AOB
-pub const SHARED_ITEMS: usize = 0x1974D280;
+/// 跨模式共用道具表（i32 ×49）的候選位址，**新的在前**。
+///
+/// ⚠ 舊註解寫「資料位址跨版本沒變」—— 2026-08-29 的更新推翻了它，
+/// 這張表也搬家了。而且**位移量跟 singleton 不一樣**
+/// （`0x39FA60` vs `0x39F988`，差 0xD8），所以不能靠「整段平移」推算，
+/// 一定要實際驗過。
+pub const SHARED_ITEMS_CANDS: [usize; 2] = [0x19AECCE0, 0x1974D280];
+/// 相容用：等於候選清單的第一個。
+pub const SHARED_ITEMS: usize = SHARED_ITEMS_CANDS[0];
 pub const SHARED_ITEM_N: usize = 49;
-/// 明星選手「道具使用次數」byte 陣列的靜態指標（未進入該模式時會是 0，讀不到屬正常）
-pub const STAR_USE_PTR: usize = 0x195FC798;
-pub const STAR_USE_PTR_ALT: usize = 0x195FFA98;
+
+/// 挑出目前有效的共用道具表位址。
+///
+/// 道具數量的合理值域是 0..=999，而失效的舊位址讀出來混著 `0xFFFFFFFF`
+/// 與 ASCII 字串 —— 用值域就能把它擋掉，不會誤寫到別的資料上。
+pub fn shared_items_addr(p: &Proc) -> Option<usize> {
+    if p.base == 0 {
+        return None;
+    }
+    for off in SHARED_ITEMS_CANDS {
+        let a = p.base + off;
+        let Some(b) = p.read(a, SHARED_ITEM_N * 4) else { continue };
+        let vals: Vec<u32> = (0..SHARED_ITEM_N)
+            .map(|i| u32::from_le_bytes(b[i * 4..i * 4 + 4].try_into().unwrap()))
+            .collect();
+        if vals.iter().all(|&v| v <= 999) && vals.iter().any(|&v| v > 0) {
+            return Some(a);
+        }
+    }
+    None
+}
+/// 明星選手「道具使用次數」byte 陣列的靜態指標候選，**新的在前**。
+///
+/// 2026-08-29 用 `pscan xref` 從計數函式往回追到的：
+/// `exe+5BFBE39: mov rcx,[rip+0x13da02f8]` → `exe+1999C138`。
+/// 舊的兩個是更新前的記錄（當時實測就是 0，位移 `0x39F9A0` 也跟這次其他位址對得上）。
+///
+/// ⚠ **這是純唯讀逆向得到的** —— 同樣的問題 2026-08-01 是靠 `pscan watch` 攔 RDI，
+/// 但那次的結論是「陣列基址是呼叫端傳進來的參數、沒有靜態指標」，**是錯的**：
+/// 18 個呼叫端裡確實有人傳參數，但也有人是從這個靜態指標讀。
+/// 攔到的那一個呼叫端不能代表全部 —— `xref` 看得到全景，斷點只看得到當下那一次。
+pub const STAR_USE_PTR_CANDS: [usize; 3] = [0x1999C138, 0x195FC798, 0x195FFA98];
+/// 相容用：等於候選清單的第一個。
+pub const STAR_USE_PTR: usize = STAR_USE_PTR_CANDS[0];
+/// 陣列長度。程式碼裡的 `cmp ebx,0x110` 就是這個上限。
+pub const STAR_USE_N: usize = 0x110;
 /// 使用次數陣列裡道具佔的區間（index ＝ 道具 ID）
 pub const STAR_USE_RANGE: std::ops::RangeInclusive<usize> = 3..=9;
+
+/// 目前有效的「道具使用次數」陣列位址。未進入明星選手模式時回 None 屬正常。
+pub fn star_use_array(p: &Proc) -> Option<usize> {
+    if p.base == 0 {
+        return None;
+    }
+    for off in STAR_USE_PTR_CANDS {
+        let a = p.u64_at(p.base + off) as usize;
+        if plausible_heap(a) && p.read(a, STAR_USE_N).is_some() {
+            return Some(a);
+        }
+    }
+    None
+}
 
 /// 「練習效果提升中」的剩餘天數，i16，**就在道具物件裡**（緊接 221 格道具陣列之後：
 /// `+0x0C + 221*4 = +0x380`，再 2 bytes 就是它）。
@@ -1073,8 +1395,9 @@ pub fn set_shared_items(p: &Proc, val: u32) -> bool {
     if p.base == 0 {
         return false;
     }
+    let Some(a) = shared_items_addr(p) else { return false };
     let buf: Vec<u8> = (0..SHARED_ITEM_N).flat_map(|_| val.to_le_bytes()).collect();
-    p.write(p.base + SHARED_ITEMS, &buf)
+    p.write(a, &buf)
 }
 
 /// 栄冠「每人只能用 1 個道具／書籍最多 5 本」＝ `+0x1511`/`+0x1512` 兩個 byte。
@@ -1092,17 +1415,12 @@ pub fn clear_star_item_uses(p: &Proc) -> bool {
     if p.base == 0 {
         return false;
     }
-    for ptr in [STAR_USE_PTR, STAR_USE_PTR_ALT] {
-        let arr = p.u64_at(p.base + ptr) as usize;
-        if arr == 0 {
-            continue;
-        }
-        let n = STAR_USE_RANGE.end() - STAR_USE_RANGE.start() + 1;
-        if p.write(arr + STAR_USE_RANGE.start(), &vec![0u8; n]) {
-            return true;
-        }
-    }
-    false
+    let Some(arr) = star_use_array(p) else { return false };
+    let n = STAR_USE_RANGE.end() - STAR_USE_RANGE.start() + 1;
+    // ⚠ 只清道具那 7 格。整個陣列有 272 格，其餘是別的東西的計數
+    //   （`pscan xref` 查出這個計數函式有 18 個呼叫端），清掉會波及無關的功能 ——
+    //   這正是「不要 nop 掉 inc al」的同一個理由。
+    p.write(arr + STAR_USE_RANGE.start(), &vec![0u8; n])
 }
 
 // ─────────────────────────────────────────────── 明星選手：成長經驗值（★ 能力值的真正來源）
@@ -1465,20 +1783,37 @@ pub fn set_growth_target(p: &Proc, base: usize, target: i32) -> bool {
     ok_stat && ok_field
 }
 
-/// 明星選手的物件都落在這個區間（實測 `0xd7`~`0xee`）。
-/// 先掃這裡命中率極高，掃不到再退回全記憶體 —— 6000MB → 512MB，快一個數量級。
-pub const GROWTH_HOT_LO: usize = 0xd000_0000;
-pub const GROWTH_HOT_HI: usize = 0xf000_0000;
+/// 明星選手物件常出現的區間，**依序**試，命中就不再往下掃。
+///
+/// | 觀測 | 區間 |
+/// |---|---|
+/// | 2026-08-27 更新後 | `0x1_0000_0000`~`0x1_3000_0000`（實測結構在 `0x113e`／`0x113f`） |
+/// | 更新前 | `0xd000_0000`~`0xf000_0000`（實測 `0xd7`~`0xee`） |
+///
+/// ⚠ 這只是加速用的猜測，**掃不到一定要退回全記憶體** ——
+/// 熱區失準時症狀不是「找不到」而是「變慢」（2026-08-29 從 1.4 秒變成 34 秒），
+/// 很容易被當成正常而放著不管。
+pub const GROWTH_HOT_ZONES: [(usize, usize); 2] =
+    [(0x1_0000_0000, 0x1_3000_0000), (0xd000_0000, 0xf000_0000)];
 
 /// 先掃熱區，沒有才全掃。給「只找主角、不要等 100 秒全掃」用。
 pub fn find_growth_structs_fast(p: &Proc) -> Vec<usize> {
-    let hot: Vec<(usize, usize)> = p
-        .writable_ranges()
-        .into_iter()
-        .filter(|&(b, s)| b + s > GROWTH_HOT_LO && b < GROWTH_HOT_HI)
-        .collect();
-    let r = find_growth_in(p, &hot);
-    if r.is_empty() { find_growth_structs(p) } else { r }
+    let all = p.writable_ranges();
+    for (lo, hi) in GROWTH_HOT_ZONES {
+        let hot: Vec<(usize, usize)> = all
+            .iter()
+            .copied()
+            .filter(|&(b, s)| b + s > lo && b < hi)
+            .collect();
+        if hot.is_empty() {
+            continue;
+        }
+        let r = find_growth_in(p, &hot);
+        if !r.is_empty() {
+            return r;
+        }
+    }
+    find_growth_in(p, &all)
 }
 
 /// 全記憶體找出所有成長經驗值結構（選手物件位址不明時的後備手段）。
