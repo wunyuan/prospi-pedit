@@ -522,6 +522,10 @@ pub const OFF_MOOD: usize = 0xE82;
 /// 栄冠球員體力（u16 little-endian，0..=0x01F4 / 0..=500）
 pub const OFF_ENERGY: usize = 0xE86;
 /// 栄冠球員學力實際值；畫面 Rank 依區間 E/D/C/B/A 顯示
+/// ⚠ **不要寫這裡，也不要當成學力。** 2026-08-29 實測：
+/// 寫 0、6、30、100、117、200、255 全部試過，畫面一律停在 E ——
+/// 這個 offset 對顯示沒有任何作用。真正的來源還沒找到。
+/// （實際值域 26~117 且隨年級遞增，看起來確實是某種累積點數，但不是畫面在讀的那個。）
 pub const OFF_ACADEMIC: usize = 0xE88;
 /// 栄冠球員招募評價（u16 little-endian，0..=0x01FF / 0..=511）
 pub const OFF_RECRUIT_EVAL: usize = 0xE8C;
@@ -2176,16 +2180,10 @@ pub fn write_batting_aggression(p: &Proc, obj: usize, grade: u8) -> bool {
         return false;
     }
 
+    // ⚠ 不寫 OFF_BATTING_AGGRESSION_SYNC —— 實測是副本（見常數處的說明）
     let a = p.u8_at(obj + OFF_BATTING_AGGRESSION);
     let na = (a & !0x07) | (grade & 0x07);
-
-    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
-    let sync = 7 - grade;
-    let b = p.u8_at(obj + OFF_BATTING_AGGRESSION_SYNC);
-    let nb = (b & !0x07) | (sync & 0x07);
-
     p.write(obj + OFF_BATTING_AGGRESSION, &[na])
-        && p.write(obj + OFF_BATTING_AGGRESSION_SYNC, &[nb])
 }
 
 /// 寫入栄冠「選球眼」等級（0=G … 6=A；沒有 S）。
@@ -2205,16 +2203,10 @@ pub fn write_plate_discipline(p: &Proc, obj: usize, grade: u8) -> bool {
         return false;
     }
 
+    // ⚠ 不寫 OFF_PLATE_DISCIPLINE_SYNC —— 實測是副本
     let a = p.u8_at(obj + OFF_PLATE_DISCIPLINE);
     let na = (a & !PLATE_DISCIPLINE_MASK) | ((grade & 7) << PLATE_DISCIPLINE_SHIFT);
-
-    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
-    let sync = 7 - grade;
-    let b = p.u8_at(obj + OFF_PLATE_DISCIPLINE_SYNC);
-    let nb = (b & !0x07) | (sync & 0x07);
-
     p.write(obj + OFF_PLATE_DISCIPLINE, &[na])
-        && p.write(obj + OFF_PLATE_DISCIPLINE_SYNC, &[nb])
 }
 
 /// 寫入栄冠「人氣」旗標。
@@ -2234,10 +2226,8 @@ pub fn write_popularity(p: &Proc, obj: usize, on: bool) -> bool {
     let nv = (cur & !POPULARITY_MASK) | v;
 
     let sync_cur = p.u8_at(obj + OFF_POPULARITY_SYNC);
-    let sync_nv = (sync_cur & !POPULARITY_MASK) | v;
-
+    let _ = sync_cur; // ⚠ 不寫 OFF_POPULARITY_SYNC —— 實測是副本
     p.write(obj + OFF_POPULARITY, &[nv])
-        && p.write(obj + OFF_POPULARITY_SYNC, &[sync_nv])
 }
 
 /// 寫入九宮格。只動低 27 bits，高 5 bits（別的欄位）原樣保留。
@@ -2484,6 +2474,9 @@ pub const OFF_BATTING_AGGRESSION: usize = 0xA5B;
 
 /// 打擊積極性同步欄位：`+0x10AE` low3。
 /// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+/// ⚠ **打擊積極性的副本，遊戲既不讀也不回寫 —— 不要寫它。**
+/// 2026-08-29 實測：只寫主值、這裡完全不動，畫面照樣正確改變。
+/// 值是主值的反向編碼（`7 - grade`），保留常數只為記下「這裡有一份」。
 pub const OFF_BATTING_AGGRESSION_SYNC: usize = 0x10AE;
 
 /// 選球眼顯示等級：`+0xA53` bit3~5。
@@ -2494,6 +2487,9 @@ pub const PLATE_DISCIPLINE_MASK: u8 = 0x38;
 
 /// 選球眼同步欄位：`+0x10AA` low3。
 /// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+/// ⚠ **選球眼的副本，遊戲既不讀也不回寫 —— 不要寫它。**
+/// 2026-08-29 實測：只寫主值、這裡完全不動，畫面照樣正確改變。
+/// 值是主值的反向編碼（`7 - grade`），保留常數只為記下「這裡有一份」。
 pub const OFF_PLATE_DISCIPLINE_SYNC: usize = 0x10AA;
 
 /// 人氣直接顯示欄位與主要守備位置共用 `+0xA30`。
@@ -2505,6 +2501,9 @@ pub const POPULARITY_ON: u8 = 0x02;
 
 /// 人氣同步／結算欄位：`+0x10B6` low3。
 /// 三位球員以書本取得人氣時皆觀察到 1 -> 2；單獨改此欄不影響即時顯示。
+/// ⚠ **人氣的副本，遊戲既不讀也不回寫 —— 不要寫它。**
+/// 2026-08-29 實測：只寫主值、這裡完全不動，畫面照樣正確改變。
+/// 值是主值的反向編碼（`7 - grade`），保留常數只為記下「這裡有一份」。
 pub const OFF_POPULARITY_SYNC: usize = 0x10B6;
 
 // ─────────────────────────────────────────────── 栄冠：打擊姿勢 / 打球型態

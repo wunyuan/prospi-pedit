@@ -2019,33 +2019,10 @@ impl App {
                     });
                     ui.end_row();
 
-                    // 學力儲存的是連續數值，UI 依實測區間轉成 Rank。
-                    // 選擇 Rank 時寫入該區間最高值。
-                    const ACADEMIC_NAMES: [&str; 5] = ["E", "D", "C", "B", "A"];
-                    const ACADEMIC_WRITE: [u8; 5] = [0x23, 0x2D, 0x37, 0x41, 0x4B];
-                    let mut rank: u8 = match cur.academic {
-                        0x00..=0x23 => 0,
-                        0x24..=0x2D => 1,
-                        0x2E..=0x37 => 2,
-                        0x38..=0x41 => 3,
-                        0x42..=0x4B => 4,
-                        _ => 0xFF,
-                    };
-                    ui.label("學力").on_hover_text(format!("目前實際值：0x{:02X}", cur.academic));
-                    let old_rank = rank;
-                    let shown = ACADEMIC_NAMES.get(rank as usize).copied().unwrap_or("未知");
-                    egui::ComboBox::from_id_source(("academic", obj))
-                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
-                            for (v, name) in ACADEMIC_NAMES.iter().enumerate() {
-                                ui.selectable_value(&mut rank, v as u8, *name);
-                            }
-                        });
-                    if rank != old_rank && (rank as usize) < ACADEMIC_WRITE.len() {
-                        cur.academic = ACADEMIC_WRITE[rank as usize];
-                        let ok = P!().write(obj + OFF_ACADEMIC, &[cur.academic]);
-                        act = Some((ok, format!("學力 → {}", ACADEMIC_NAMES[rank as usize])));
-                    }
-                    ui.end_row();
+                    // ⚠ 學力（+0xE88）的編輯功能已移除 —— 2026-08-29 實測寫 0 與 255
+                    //   畫面都停在 E，寫什麼都沒反應。PR #1 原本的區間表最高只到 0x4B(75)，
+                    //   但實際值域是 26~117，模型本身也不完整。
+                    //   真正的來源還沒找到，找到之前不提供編輯，免得使用者以為改好了。
 
                     // 招募評價：u16，0..=0x01FF；星數只是遊戲 UI 的區間顯示。
                     let stars = match cur.recruit_eval.min(0x01FF) {
