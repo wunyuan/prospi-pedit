@@ -479,6 +479,18 @@ pub const OFF_BALL: usize = 0x30;
 pub const OFF_ORIG: usize = 0x54;
 pub const OFF_NAME: usize = 0x914;
 pub const OFF_GRADE: usize = 0xE50;
+/// 栄冠球員信賴度（0..=0xC8 / 0..=200）
+pub const OFF_TRUST: usize = 0xE80;
+/// 栄冠球員個性 ID（0x00..0x07）
+pub const OFF_PERSONALITY: usize = 0xE81;
+/// 栄冠球員情緒 ID（0=超興奮, 1=興奮, 2=普通, 3=消沉）
+pub const OFF_MOOD: usize = 0xE82;
+/// 栄冠球員體力（u16 little-endian，0..=0x01F4 / 0..=500）
+pub const OFF_ENERGY: usize = 0xE86;
+/// 栄冠球員學力實際值；畫面 Rank 依區間 E/D/C/B/A 顯示
+pub const OFF_ACADEMIC: usize = 0xE88;
+/// 栄冠球員招募評價（u16 little-endian，0..=0x01FF / 0..=511）
+pub const OFF_RECRUIT_EVAL: usize = 0xE8C;
 pub const OFF_ITEM: usize = 0x1511;
 pub const OFF_BOOK: usize = 0x1512;
 
@@ -776,6 +788,18 @@ pub struct Player {
     pub stamina: u16,
     pub pack_hi: u16,
     pub grade: u8,
+    /// 栄冠球員信賴度（0..=200）
+    pub trust: u8,
+    /// 栄冠球員個性（0=非常普通 … 7=精明幹練）
+    pub personality: u8,
+    /// 栄冠球員情緒（0=超興奮, 1=興奮, 2=普通, 3=消沉）
+    pub mood: u8,
+    /// 栄冠球員體力（0..=500）
+    pub energy: u16,
+    /// 栄冠球員學力實際值（E=00..23, D=24..2D, C=2E..37, B=38..41, A=42..4B）
+    pub academic: u8,
+    /// 栄冠球員招募評價（0..=511；畫面以 1..5 星顯示）
+    pub recruit_eval: u16,
     pub item: u8,
     pub book: u8,
     pub balls: Vec<Ball>,
@@ -867,6 +891,7 @@ impl Player {
             return None;
         }
         let u8a = |o: usize| b[o];
+        let u16a = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
         let pack = u16::from_le_bytes([b[OFF_PACK], b[OFF_PACK + 1]]);
         let mut pl = Player {
             addr: obj,
@@ -884,6 +909,12 @@ impl Player {
             stamina: (pack >> 7) & 0x7F,
             pack_hi: pack & 0xC000,
             grade: u8a(OFF_GRADE),
+            trust: u8a(OFF_TRUST),
+            personality: u8a(OFF_PERSONALITY),
+            mood: u8a(OFF_MOOD),
+            energy: u16a(OFF_ENERGY),
+            academic: u8a(OFF_ACADEMIC),
+            recruit_eval: u16a(OFF_RECRUIT_EVAL),
             item: u8a(OFF_ITEM),
             book: u8a(OFF_BOOK),
             ..Default::default()

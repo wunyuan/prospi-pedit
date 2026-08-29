@@ -1873,6 +1873,130 @@ impl App {
             ui.separator();
         }
 
+        // ── 個人特質（栄冠專用）
+        if self.mode == Mode::Koshien {
+            egui::CollapsingHeader::new("個人特質").default_open(true).show(ui, |ui| {
+                egui::Grid::new("personal_traits").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    // 信賴度：u8，遊戲有效上限 0xC8 = 200。
+                    ui.label("信賴度").on_hover_text("Player Object +0xE80 / u8 / 0～200");
+                    ui.horizontal(|ui| {
+                        let mut v = cur.trust.min(200);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=200).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=200).speed(1.0)).changed();
+                        if slider_changed || input_changed {
+                            cur.trust = v.min(200);
+                            let ok = P!().write(obj + OFF_TRUST, &[cur.trust]);
+                            act = Some((ok, format!("信賴度 → {}", cur.trust)));
+                        }
+                    });
+                    ui.end_row();
+
+                    const PERSONALITY_NAMES: [&str; 8] = [
+                        "非常普通", "調皮型", "熱血男兒", "冷靜型",
+                        "內向", "天才", "人來瘋", "精明幹練",
+                    ];
+                    ui.label("性格");
+                    let old = cur.personality;
+                    let shown = PERSONALITY_NAMES.get(cur.personality as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("personality", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in PERSONALITY_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.personality, v as u8, *name);
+                            }
+                        });
+                    if cur.personality != old {
+                        let ok = P!().write(obj + OFF_PERSONALITY, &[cur.personality]);
+                        act = Some((ok, format!("性格 → {}", PERSONALITY_NAMES[cur.personality as usize])));
+                    }
+                    ui.end_row();
+
+                    const MOOD_NAMES: [&str; 4] = ["超興奮", "興奮", "普通", "消沉"];
+                    ui.label("情緒");
+                    let old = cur.mood;
+                    let shown = MOOD_NAMES.get(cur.mood as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("mood", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in MOOD_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.mood, v as u8, *name);
+                            }
+                        });
+                    if cur.mood != old {
+                        let ok = P!().write(obj + OFF_MOOD, &[cur.mood]);
+                        act = Some((ok, format!("情緒 → {}", MOOD_NAMES[cur.mood as usize])));
+                    }
+                    ui.end_row();
+
+                    // 體力：u16 little-endian，遊戲有效上限 0x01F4 = 500。
+                    ui.label("體力").on_hover_text("Player Object +0xE86 / u16 / 0～500（0x0000～0x01F4）");
+                    ui.horizontal(|ui| {
+                        let mut v = cur.energy.min(500);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=500).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=500).speed(1.0)).changed();
+                        if slider_changed || input_changed {
+                            cur.energy = v.min(500);
+                            let ok = P!().write(obj + OFF_ENERGY, &cur.energy.to_le_bytes());
+                            act = Some((ok, format!("體力 → {}", cur.energy)));
+                        }
+                    });
+                    ui.end_row();
+
+                    // 學力儲存的是連續數值，UI 依實測區間轉成 Rank。
+                    // 選擇 Rank 時寫入該區間最高值。
+                    const ACADEMIC_NAMES: [&str; 5] = ["E", "D", "C", "B", "A"];
+                    const ACADEMIC_WRITE: [u8; 5] = [0x23, 0x2D, 0x37, 0x41, 0x4B];
+                    let mut rank: u8 = match cur.academic {
+                        0x00..=0x23 => 0,
+                        0x24..=0x2D => 1,
+                        0x2E..=0x37 => 2,
+                        0x38..=0x41 => 3,
+                        0x42..=0x4B => 4,
+                        _ => 0xFF,
+                    };
+                    ui.label("學力").on_hover_text(format!("目前實際值：0x{:02X}", cur.academic));
+                    let old_rank = rank;
+                    let shown = ACADEMIC_NAMES.get(rank as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("academic", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in ACADEMIC_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut rank, v as u8, *name);
+                            }
+                        });
+                    if rank != old_rank && (rank as usize) < ACADEMIC_WRITE.len() {
+                        cur.academic = ACADEMIC_WRITE[rank as usize];
+                        let ok = P!().write(obj + OFF_ACADEMIC, &[cur.academic]);
+                        act = Some((ok, format!("學力 → {}", ACADEMIC_NAMES[rank as usize])));
+                    }
+                    ui.end_row();
+
+                    // 招募評價：u16，0..=0x01FF；星數只是遊戲 UI 的區間顯示。
+                    let stars = match cur.recruit_eval.min(0x01FF) {
+                        0x0000..=0x0027 => 1,
+                        0x0028..=0x004F => 2,
+                        0x0050..=0x009F => 3,
+                        0x00A0..=0x00EF => 4,
+                        _ => 5,
+                    };
+                    ui.label("招募評價").on_hover_text(format!(
+                        "Player Object +0xE8C / u16 / 0～511（0x0000～0x01FF）\n目前：{}★",
+                        stars
+                    ));
+                    ui.horizontal(|ui| {
+                        let mut v = cur.recruit_eval.min(511);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=511).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=511).speed(1.0)).changed();
+                        ui.label("★".repeat(stars));
+                        if slider_changed || input_changed {
+                            cur.recruit_eval = v.min(511);
+                            let ok = P!().write(obj + OFF_RECRUIT_EVAL, &cur.recruit_eval.to_le_bytes());
+                            act = Some((ok, format!("招募評價 → {}", cur.recruit_eval)));
+                        }
+                    });
+                    ui.end_row();
+                });
+            });
+            ui.separator();
+        }
+
         // ── 基本
         egui::CollapsingHeader::new("基本").default_open(true).show(ui, |ui| {
             egui::Grid::new("basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -2001,6 +2125,7 @@ impl App {
                     act = Some((ok, "書籍使用次數".into()));
                 }
                 ui.end_row();
+
             });
             if ui.button("道具/書籍使用次數歸零（＝無限使用）").clicked() {
                 cur.item = 0;
