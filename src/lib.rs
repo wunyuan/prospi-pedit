@@ -1335,16 +1335,22 @@ fn koshien_roster_wrapper(p: &Proc) -> usize {
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
 ///
 /// **三層**，一層比一層貴，前一層拿得到就不會走到下一層：
-/// 1. wrapper 鏈（PR #1）
-/// 2. `modeobj + KOSHIEN_ARRAY`（同一份資料的另一條路徑）
+/// 1. `modeobj + KOSHIEN_ARRAY`
+/// 2. wrapper 鏈（PR #1）
 /// 3. 全記憶體掃描（每個 pid 只掃一次，見 [`koshien_modeobj_scanned`]）
+///
+/// ⚠ **順序是實測決定的，不要調回去。** 2026-08-29 讀完存檔後實測：
+/// wrapper 鏈第 3 跳落到一個非 8 對齊的位址、第 4 跳讀出 `0xFF`，**整條斷掉**；
+/// 同一時刻 `modeobj + KOSHIEN_ARRAY` 正常回傳 30 人。
+/// 兩條路的終點本來是同一個位置（wrapper ＝ `modeobj + 0x185440`），
+/// 但中間那幾層顯然會隨畫面／載入狀態變動，所以走固定 offset 的那條穩定得多。
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
-    let w = koshien_roster_wrapper(p);
-    if w != 0 {
-        let n = p.u64_at(w + 0x08) as usize;
-        if n > 0 && n <= 128 {
+    let modeobj = koshien_modeobj(p);
+    if modeobj != 0 {
+        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
+        if n > 0 && n <= 512 {
             let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(w + 0x10 + i * 8) as usize)
+                .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
                 .filter(|&o| o != 0)
                 .collect();
             if !v.is_empty() {
@@ -1352,12 +1358,12 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
             }
         }
     }
-    let modeobj = koshien_modeobj(p);
-    if modeobj != 0 {
-        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
-        if n > 0 && n <= 512 {
+    let w = koshien_roster_wrapper(p);
+    if w != 0 {
+        let n = p.u64_at(w + 0x08) as usize;
+        if n > 0 && n <= 128 {
             let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
+                .map(|i| p.u64_at(w + 0x10 + i * 8) as usize)
                 .filter(|&o| o != 0)
                 .collect();
             if !v.is_empty() {
