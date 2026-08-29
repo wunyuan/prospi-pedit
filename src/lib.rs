@@ -1078,6 +1078,45 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
         .collect()
 }
 
+/// 取得「可安全進行全隊修改」的榮冠 roster。
+///
+/// 與 `koshien_roster()` 不同，這裡採保守策略：
+/// - wrapper / count 必須有效，count 需在合理範圍內；
+/// - count 個 slot 必須全部是非 0、互不重複的 Player Object；
+/// - 每個 Player Object 都必須能讀到合理姓名。
+///
+/// 任一檢查失敗就整批拒絕，避免 roster chain 尚未切到正確 state 時誤寫其他物件。
+pub fn validated_koshien_roster(p: &Proc) -> Result<Vec<usize>, String> {
+    let wrapper = koshien_roster_wrapper(p);
+    if wrapper == 0 {
+        return Err("榮冠球員名單尚未就緒（未在球員列表中或找不到 roster wrapper）".into());
+    }
+
+    let count = p.u64_at(wrapper + 0x08) as usize;
+    if count == 0 || count > 128 {
+        return Err(format!("榮冠球員人數異常：{count}"));
+    }
+
+    let mut out = Vec::with_capacity(count);
+    let mut seen = std::collections::HashSet::with_capacity(count);
+    for i in 0..count {
+        let obj = p.u64_at(wrapper + 0x10 + i * 8) as usize;
+        if obj == 0 {
+            return Err(format!("榮冠 roster #{i} 的 Player Object 為 0"));
+        }
+        if !seen.insert(obj) {
+            return Err(format!("榮冠 roster #{i} 出現重複 Player Object {obj:#x}"));
+        }
+        let name = read_name(p, obj);
+        if !sane_name(&name) {
+            return Err(format!("榮冠 roster #{i} 的 Player Object 驗證失敗 ({obj:#x})"));
+        }
+        out.push(obj);
+    }
+
+    Ok(out)
+}
+
 // ─────────────────────────────────────────────── 常規作弊（道具類）
 
 /// modeobj + 這個 ＝ 栄冠道具物件的指標；物件 `+0x0C` 才是資料起點
@@ -1147,9 +1186,28 @@ pub fn set_shared_items(p: &Proc, val: u32) -> bool {
 /// 栄冠「每人只能用 1 個道具／書籍最多 5 本」＝ `+0x1511`/`+0x1512` 兩個 byte。
 /// 持續歸零就等同無限使用（上限判斷讀的就是它們）。回傳處理了幾位部員。
 pub fn clear_koshien_use_limits(p: &Proc) -> usize {
-    koshien_roster(p)
+    let Ok(roster) = validated_koshien_roster(p) else {
+        return 0;
+    };
+    roster
         .iter()
         .filter(|&&o| p.write(o + OFF_ITEM, &[0, 0]))
+        .count()
+}
+
+/// 榮冠：把目前 roster 中所有部員的情緒設為指定值。
+/// 情緒欄位為 Player Object +0xE82；0=超興奮、1=興奮、2=普通、3=消沉。
+/// 回傳成功寫入的部員人數。
+pub fn set_koshien_all_mood(p: &Proc, mood: u8) -> usize {
+    if mood > 3 {
+        return 0;
+    }
+    let Ok(roster) = validated_koshien_roster(p) else {
+        return 0;
+    };
+    roster
+        .iter()
+        .filter(|&&o| p.write(o + OFF_MOOD, &[mood]))
         .count()
 }
 

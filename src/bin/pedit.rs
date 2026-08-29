@@ -1250,6 +1250,47 @@ impl eframe::App for App {
                         };
                     }
                 }
+
+                if ui.button("榮冠：所有球員情緒 → 超興奮（單次）")
+                    .on_hover_text(
+                        "把目前榮冠 roster 中所有部員的情緒一次設成「超興奮」。\n\
+                         寫入 Player Object +0xE82 = 0。\n\
+                         執行前會先完整驗證 roster count、每個 Player Object 與姓名；\n\
+                         任一項異常就整批取消，不會寫入任何球員。\n\
+                         這是單次修改；之後遊戲事件若改變情緒，需要再按一次。")
+                    .clicked()
+                {
+                    if self.ensure_proc() {
+                        let checked = self.proc.as_ref()
+                            .map(|p| validated_koshien_roster(p))
+                            .unwrap_or_else(|| Err("尚未附加遊戲".into()));
+                        match checked {
+                            Ok(roster) => {
+                                let expected = roster.len();
+                                let n = self.proc.as_ref()
+                                    .map_or(0, |p| set_koshien_all_mood(p, 0));
+                                if n == expected && n > 0 {
+                                    for pl in &mut self.list {
+                                        if roster.contains(&pl.addr) {
+                                            pl.mood = 0;
+                                        }
+                                    }
+                                    if let Some(cur) = self.cur.as_mut() {
+                                        if roster.contains(&cur.addr) {
+                                            cur.mood = 0;
+                                        }
+                                    }
+                                    self.status = format!("已將 {n} 位榮冠球員情緒設為超興奮");
+                                } else {
+                                    self.status = format!("寫入未完整完成（成功 {n}/{expected}），請重新取得名單後再試");
+                                }
+                            }
+                            Err(e) => {
+                                self.status = format!("未進行修改 —— {e}");
+                            }
+                        }
+                    }
+                }
             });
             ui.add_space(3.0);
         });
