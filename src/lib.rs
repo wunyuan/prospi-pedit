@@ -513,6 +513,18 @@ pub const OFF_BALL: usize = 0x30;
 pub const OFF_ORIG: usize = 0x54;
 pub const OFF_NAME: usize = 0x914;
 pub const OFF_GRADE: usize = 0xE50;
+/// 栄冠球員信賴度（0..=0xC8 / 0..=200）
+pub const OFF_TRUST: usize = 0xE80;
+/// 栄冠球員個性 ID（0x00..0x07）
+pub const OFF_PERSONALITY: usize = 0xE81;
+/// 栄冠球員情緒 ID（0=超興奮, 1=興奮, 2=普通, 3=消沉）
+pub const OFF_MOOD: usize = 0xE82;
+/// 栄冠球員體力（u16 little-endian，0..=0x01F4 / 0..=500）
+pub const OFF_ENERGY: usize = 0xE86;
+/// 栄冠球員學力實際值；畫面 Rank 依區間 E/D/C/B/A 顯示
+pub const OFF_ACADEMIC: usize = 0xE88;
+/// 栄冠球員招募評價（u16 little-endian，0..=0x01FF / 0..=511）
+pub const OFF_RECRUIT_EVAL: usize = 0xE8C;
 pub const OFF_ITEM: usize = 0x1511;
 pub const OFF_BOOK: usize = 0x1512;
 
@@ -790,6 +802,18 @@ pub struct Player {
     pub pos: u8,
     /// `+0x2C` bit4~6 捕手配球（0=G … 7=S）
     pub catcher: u8,
+    /// 栄冠「野手風格／打擊積極性」等級（0=G … 6=A；沒有 S）。
+    /// 畫面等級由 +0xA5B low3 決定；+0x10AE low3 是同步值。
+    pub batting_aggression: u8,
+    /// 栄冠「野手風格／選球眼」等級（0=G … 6=A；沒有 S）。
+    /// 畫面等級由 +0xA53 bit3~5 決定；+0x10AA low3 是同步值。
+    pub plate_discipline: u8,
+    /// 栄冠「野手風格／人氣」。
+    /// +0xA30 low3：實測 1=無、2=有；同 byte 的 bit3~6 是主要守備位置。
+    pub popularity: bool,
+    /// 栄冠的打擊姿勢/打球型態（0..6；見 [`BATTING_STYLE_NAMES`]）。
+    /// 由 +0x2C bit7、+0x2D low2、+0xFB6 low3 三欄聯合判定；未知組合為 0xFF。
+    pub batting_style: u8,
     /// `+0xA16` 隊伍 ID（明星選手模式用來分隊）
     pub team: u8,
     /// `+0xA50` 擅長・不擅長球路九宮格，畫面列優先，各 −3..+3
@@ -798,6 +822,18 @@ pub struct Player {
     pub stamina: u16,
     pub pack_hi: u16,
     pub grade: u8,
+    /// 栄冠球員信賴度（0..=200）
+    pub trust: u8,
+    /// 栄冠球員個性（0=非常普通 … 7=精明幹練）
+    pub personality: u8,
+    /// 栄冠球員情緒（0=超興奮, 1=興奮, 2=普通, 3=消沉）
+    pub mood: u8,
+    /// 栄冠球員體力（0..=500）
+    pub energy: u16,
+    /// 栄冠球員學力實際值（E=00..23, D=24..2D, C=2E..37, B=38..41, A=42..4B）
+    pub academic: u8,
+    /// 栄冠球員招募評價（0..=511；畫面以 1..5 星顯示）
+    pub recruit_eval: u16,
     pub item: u8,
     pub book: u8,
     pub balls: Vec<Ball>,
@@ -889,6 +925,7 @@ impl Player {
             return None;
         }
         let u8a = |o: usize| b[o];
+        let u16a = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
         let pack = u16::from_le_bytes([b[OFF_PACK], b[OFF_PACK + 1]]);
         let mut pl = Player {
             addr: obj,
@@ -896,11 +933,22 @@ impl Player {
             defense: u8a(OFF_DEF),
             pos: ((u16::from_le_bytes([b[OFF_POS], b[OFF_POS + 1]]) >> POS_SHIFT) & 0xF) as u8,
             catcher: (u8a(OFF_CATCH) >> CATCH_SHIFT) & 7,
+            batting_aggression: u8a(OFF_BATTING_AGGRESSION) & 7,
+            plate_discipline: (u8a(OFF_PLATE_DISCIPLINE) >> PLATE_DISCIPLINE_SHIFT) & 7,
+            popularity: (u8a(OFF_POPULARITY) & POPULARITY_MASK) == POPULARITY_ON,
+            batting_style: batting_style_from_raw(u8a(OFF_CATCH), u8a(OFF_BATTING_STYLE), u8a(OFF_BATTING_SYNC))
+                .unwrap_or(BATTING_STYLE_UNKNOWN),
             team: u8a(OFF_TEAM),
             speed: (pack & 0x7F) + 80,
             stamina: (pack >> 7) & 0x7F,
             pack_hi: pack & 0xC000,
             grade: u8a(OFF_GRADE),
+            trust: u8a(OFF_TRUST),
+            personality: u8a(OFF_PERSONALITY),
+            mood: u8a(OFF_MOOD),
+            energy: u16a(OFF_ENERGY),
+            academic: u8a(OFF_ACADEMIC),
+            recruit_eval: u16a(OFF_RECRUIT_EVAL),
             item: u8a(OFF_ITEM),
             book: u8a(OFF_BOOK),
             ..Default::default()
@@ -1011,6 +1059,8 @@ pub fn clear_rec(p: &Proc, obj: usize, idx: usize) -> bool {
 }
 
 // ─────────────────────────────────────────────── 栄冠（高中）指標鏈
+// 2026-08-28 新版：同一個 static root 分成「部員名單」與「道具」兩條鏈
+// （wrapper 鏈由 PR #1 找到；終點跟 `modeobj + 0x185440` 是同一個位置）。
 
 /// 栄冠 singleton 的靜態位址，**新的在前**。
 ///
@@ -1112,7 +1162,8 @@ fn koshien_modeobj_valid(p: &Proc, m: usize) -> bool {
     sane_name(&read_name(p, first))
 }
 
-/// 栄冠模式的 mode 物件。離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
+/// 栄冠的 mode 物件（`[static] -> +0x70`），道具與練習效果都掛在它底下。
+/// 離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
 pub fn koshien_modeobj(p: &Proc) -> usize {
     if p.base == 0 {
         return 0;
@@ -1245,17 +1296,55 @@ pub fn koshien_modeobj_scanned(p: &Proc) -> usize {
     r.unwrap_or(0)
 }
 
+/// 栄冠部員名單的 wrapper：`[static] -> +0x60 -> +0x20 -> +0x78 -> +0x08`。
+///
+/// 這條鏈由 PR #1 找到。它的終點其實就是 `modeobj + 0x185440` ——
+/// wrapper `+0x08`／`+0x10` 正好等於 [`KOSHIEN_COUNT`]／[`KOSHIEN_ARRAY`]，
+/// 兩條路徑殊途同歸，留著兩條是因為**不知道下次版本會斷哪一條**。
+///
+/// 每個候選都驗到「部員數合理 ＋ 第一位讀得出合法姓名」才採用。
+fn koshien_roster_wrapper(p: &Proc) -> usize {
+    for root in koshien_static_candidates(p) {
+        let mut o = p.u64_at(root) as usize;
+        if o < 0x10000 {
+            continue;
+        }
+        let mut ok = true;
+        for off in [0x60usize, 0x20, 0x78, 0x08] {
+            o = p.u64_at(o + off) as usize;
+            if o < 0x10000 {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        let n = p.u64_at(o + 0x08) as usize;
+        if n == 0 || n > 128 {
+            continue;
+        }
+        let first = p.u64_at(o + 0x10) as usize;
+        if first >= 0x10000 && sane_name(&read_name(p, first)) {
+            return o;
+        }
+    }
+    0
+}
+
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
 ///
-/// 先走舊的靜態指標鏈（快），壞掉才退回 vector 掃描並快取結果。
+/// **三層**，一層比一層貴，前一層拿得到就不會走到下一層：
+/// 1. wrapper 鏈（PR #1）
+/// 2. `modeobj + KOSHIEN_ARRAY`（同一份資料的另一條路徑）
+/// 3. 全記憶體掃描（每個 pid 只掃一次，見 [`koshien_modeobj_scanned`]）
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
-    let modeobj = koshien_modeobj(p);
-    if modeobj != 0 {
-        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
-        if n > 0 && n <= 512 {
-            let arr = modeobj + KOSHIEN_ARRAY;
+    let w = koshien_roster_wrapper(p);
+    if w != 0 {
+        let n = p.u64_at(w + 0x08) as usize;
+        if n > 0 && n <= 128 {
             let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(arr + i * 8) as usize)
+                .map(|i| p.u64_at(w + 0x10 + i * 8) as usize)
                 .filter(|&o| o != 0)
                 .collect();
             if !v.is_empty() {
@@ -1263,7 +1352,20 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
             }
         }
     }
-    // 指標鏈失效 —— 掃描找 modeobj（每個 pid 只掃一次）
+    let modeobj = koshien_modeobj(p);
+    if modeobj != 0 {
+        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
+        if n > 0 && n <= 512 {
+            let v: Vec<usize> = (0..n)
+                .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
+                .filter(|&o| o != 0)
+                .collect();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+    }
+    // 指標鏈全斷 —— 掃描找 modeobj（每個 pid 只掃一次）
     let m = koshien_modeobj_scanned(p);
     if m == 0 {
         return Vec::new();
@@ -1278,13 +1380,48 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
         .collect()
 }
 
+/// 取得「可安全進行全隊修改」的榮冠 roster。
+///
+/// 與 `koshien_roster()` 不同，這裡採保守策略：
+/// - wrapper / count 必須有效，count 需在合理範圍內；
+/// - count 個 slot 必須全部是非 0、互不重複的 Player Object；
+/// - 每個 Player Object 都必須能讀到合理姓名。
+///
+/// 任一檢查失敗就整批拒絕，避免 roster chain 尚未切到正確 state 時誤寫其他物件。
+pub fn validated_koshien_roster(p: &Proc) -> Result<Vec<usize>, String> {
+    // ⚠ 原本綁死 wrapper 鏈，改成走 `koshien_roster()` —— 那邊有三層 fallback，
+    //   wrapper 斷掉時還有 modeobj offset 與掃描可用，全隊功能才不會整個消失。
+    let list = koshien_roster(p);
+    if list.is_empty() {
+        return Err("榮冠球員名單尚未就緒（未在球員列表中，或指標鏈與掃描都找不到）".into());
+    }
+    if list.len() > 128 {
+        return Err(format!("榮冠球員人數異常：{}", list.len()));
+    }
+
+    let mut seen = std::collections::HashSet::with_capacity(list.len());
+    for (i, &obj) in list.iter().enumerate() {
+        if obj == 0 {
+            return Err(format!("榮冠 roster #{i} 的 Player Object 為 0"));
+        }
+        if !seen.insert(obj) {
+            return Err(format!("榮冠 roster #{i} 出現重複 Player Object {obj:#x}"));
+        }
+        let name = read_name(p, obj);
+        if !sane_name(&name) {
+            return Err(format!("榮冠 roster #{i} 的 Player Object 驗證失敗 ({obj:#x})"));
+        }
+    }
+
+    Ok(list)
+}
+
 // ─────────────────────────────────────────────── 常規作弊（道具類）
 
 /// modeobj + 這個 ＝ 栄冠道具物件的指標；物件 `+0x0C` 才是資料起點
 pub const KOSHIEN_ITEMOBJ: usize = 0x185438;
 /// 栄冠道具是 i32 連續陣列，index ＝ 道具 ID，未持有 ＝ 0（UI 只顯示非零的格子）
 pub const KOSHIEN_ITEM_N: usize = 221;
-/// 跨模式共用道具表（i32 ×49）。**資料位址跨版本沒變**，不必 AOB
 /// 跨模式共用道具表（i32 ×49）的候選位址，**新的在前**。
 ///
 /// ⚠ 舊註解寫「資料位址跨版本沒變」—— 2026-08-29 的更新推翻了它，
@@ -1403,9 +1540,28 @@ pub fn set_shared_items(p: &Proc, val: u32) -> bool {
 /// 栄冠「每人只能用 1 個道具／書籍最多 5 本」＝ `+0x1511`/`+0x1512` 兩個 byte。
 /// 持續歸零就等同無限使用（上限判斷讀的就是它們）。回傳處理了幾位部員。
 pub fn clear_koshien_use_limits(p: &Proc) -> usize {
-    koshien_roster(p)
+    let Ok(roster) = validated_koshien_roster(p) else {
+        return 0;
+    };
+    roster
         .iter()
         .filter(|&&o| p.write(o + OFF_ITEM, &[0, 0]))
+        .count()
+}
+
+/// 榮冠：把目前 roster 中所有部員的情緒設為指定值。
+/// 情緒欄位為 Player Object +0xE82；0=超興奮、1=興奮、2=普通、3=消沉。
+/// 回傳成功寫入的部員人數。
+pub fn set_koshien_all_mood(p: &Proc, mood: u8) -> usize {
+    if mood > 3 {
+        return 0;
+    }
+    let Ok(roster) = validated_koshien_roster(p) else {
+        return 0;
+    };
+    roster
+        .iter()
+        .filter(|&&o| p.write(o + OFF_MOOD, &[mood]))
         .count()
 }
 
@@ -1996,6 +2152,87 @@ pub fn write_catcher(p: &Proc, obj: usize, v: u8) -> bool {
     p.write(obj + OFF_CATCH, &[nv])
 }
 
+/// 寫入栄冠「打擊積極性」等級（0=G … 6=A；沒有 S）。
+///
+/// 實測對照：
+/// G: A5B=00 / 10AE=07
+/// F: A5B=01 / 10AE=06
+/// E: A5B=02 / 10AE=05
+/// D: A5B=03 / 10AE=04
+/// C: A5B=04 / 10AE=03
+/// B: A5B=05 / 10AE=02
+/// A: A5B=06 / 10AE=01
+///
+/// 兩處都只改 low3；其他未知旗標全部保留。
+pub fn write_batting_aggression(p: &Proc, obj: usize, grade: u8) -> bool {
+    if grade > 6 {
+        return false;
+    }
+
+    let a = p.u8_at(obj + OFF_BATTING_AGGRESSION);
+    let na = (a & !0x07) | (grade & 0x07);
+
+    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
+    let sync = 7 - grade;
+    let b = p.u8_at(obj + OFF_BATTING_AGGRESSION_SYNC);
+    let nb = (b & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_BATTING_AGGRESSION, &[na])
+        && p.write(obj + OFF_BATTING_AGGRESSION_SYNC, &[nb])
+}
+
+/// 寫入栄冠「選球眼」等級（0=G … 6=A；沒有 S）。
+///
+/// 實測對照：
+/// G: A53=00 / 10AA=07
+/// F: A53=08 / 10AA=06
+/// E: A53=10 / 10AA=05
+/// D: A53=18 / 10AA=04
+/// C: A53=20 / 10AA=03
+/// B: A53=28 / 10AA=02
+/// A: A53=30 / 10AA=01
+///
+/// +0xA53 只改 bit3~5，+0x10AA 只改 low3；其他未知旗標全部保留。
+pub fn write_plate_discipline(p: &Proc, obj: usize, grade: u8) -> bool {
+    if grade > 6 {
+        return false;
+    }
+
+    let a = p.u8_at(obj + OFF_PLATE_DISCIPLINE);
+    let na = (a & !PLATE_DISCIPLINE_MASK) | ((grade & 7) << PLATE_DISCIPLINE_SHIFT);
+
+    // 觀察到的同步值與畫面等級呈反向：G=7 ... A=1。
+    let sync = 7 - grade;
+    let b = p.u8_at(obj + OFF_PLATE_DISCIPLINE_SYNC);
+    let nb = (b & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_PLATE_DISCIPLINE, &[na])
+        && p.write(obj + OFF_PLATE_DISCIPLINE_SYNC, &[nb])
+}
+
+/// 寫入栄冠「人氣」旗標。
+///
+/// 三位不同球員以書本取得人氣時都觀察到：
+/// * `+0xA30 low3: 1 -> 2`
+/// * `+0x10B6 low3: 1 -> 2`
+///
+/// 手動切換 `+0xA30 low3` 已驗證 `1=人氣消失`、`2=人氣出現`；
+/// `+0x10B6` 單獨切換不影響即時顯示，但可能是成長／結算同步欄位。
+/// 為了讓推進日期時的遊戲結算狀態也一致，兩處同步寫入。
+/// `+0xA30` 的 bit3~6 同時存主要守備位置，所以兩處都只做讀-改-寫 low3。
+pub fn write_popularity(p: &Proc, obj: usize, on: bool) -> bool {
+    let v = if on { POPULARITY_ON } else { POPULARITY_OFF };
+
+    let cur = p.u8_at(obj + OFF_POPULARITY);
+    let nv = (cur & !POPULARITY_MASK) | v;
+
+    let sync_cur = p.u8_at(obj + OFF_POPULARITY_SYNC);
+    let sync_nv = (sync_cur & !POPULARITY_MASK) | v;
+
+    p.write(obj + OFF_POPULARITY, &[nv])
+        && p.write(obj + OFF_POPULARITY_SYNC, &[sync_nv])
+}
+
 /// 寫入九宮格。只動低 27 bits，高 5 bits（別的欄位）原樣保留。
 pub fn write_zone(p: &Proc, obj: usize, z: &[i8; ZONE_N]) -> bool {
     let mut raw = p.u32_at(obj + OFF_ZONE);
@@ -2232,6 +2469,97 @@ pub fn save_teams(
     std::fs::write(path, txt).map_err(|e| format!("寫入 {} 失敗：{e}", path.display()))
 }
 
+// ─────────────────────────────────────────────── 栄冠：野手風格（打擊積極性／選球眼）
+
+/// 打擊積極性顯示等級：`+0xA5B` low3。
+/// 實測 0..6 分別為 G/F/E/D/C/B/A，沒有 S。
+pub const OFF_BATTING_AGGRESSION: usize = 0xA5B;
+
+/// 打擊積極性同步欄位：`+0x10AE` low3。
+/// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+pub const OFF_BATTING_AGGRESSION_SYNC: usize = 0x10AE;
+
+/// 選球眼顯示等級：`+0xA53` bit3~5。
+/// 實測 0..6 分別為 G/F/E/D/C/B/A，沒有 S。
+pub const OFF_PLATE_DISCIPLINE: usize = 0xA53;
+pub const PLATE_DISCIPLINE_SHIFT: u32 = 3;
+pub const PLATE_DISCIPLINE_MASK: u8 = 0x38;
+
+/// 選球眼同步欄位：`+0x10AA` low3。
+/// 實測 G/F/E/D/C/B/A 對應 7/6/5/4/3/2/1。
+pub const OFF_PLATE_DISCIPLINE_SYNC: usize = 0x10AA;
+
+/// 人氣直接顯示欄位與主要守備位置共用 `+0xA30`。
+/// low3 實測：1=無人氣、2=有人氣；bit3~6 是主要守備位置，絕對不能整 byte 覆蓋。
+pub const OFF_POPULARITY: usize = OFF_POS;
+pub const POPULARITY_MASK: u8 = 0x07;
+pub const POPULARITY_OFF: u8 = 0x01;
+pub const POPULARITY_ON: u8 = 0x02;
+
+/// 人氣同步／結算欄位：`+0x10B6` low3。
+/// 三位球員以書本取得人氣時皆觀察到 1 -> 2；單獨改此欄不影響即時顯示。
+pub const OFF_POPULARITY_SYNC: usize = 0x10B6;
+
+// ─────────────────────────────────────────────── 栄冠：打擊姿勢 / 打球型態
+
+/// 打擊姿勢主欄位：`+0x2D` 的 low 2 bits。
+/// 實測 high bits（例如 0x04）不影響這組能力顯示，所以寫入時保留它們。
+pub const OFF_BATTING_STYLE: usize = 0x2D;
+
+/// 打擊姿勢同步欄位：`+0xFB6` 的 low 3 bits。
+/// 目前只確認 0..6；其餘 high bits 保留，避免破壞未知旗標。
+pub const OFF_BATTING_SYNC: usize = 0xFB6;
+
+pub const BATTING_STYLE_UNKNOWN: u8 = 0xFF;
+pub const BATTING_STYLE_NAMES: [&str; 7] = [
+    "滾地球型", "低仰角", "中仰角", "高仰角", "平飛球強襲", "力量型打者", "全壘打藝術家",
+];
+
+/// (2C bit7, 2D low2, FB6 low3)。
+/// 2026-08-23 以兩位栄冠球員交叉驗證：低仰角／力量型打者／全壘打藝術家完全一致；
+/// 第一位另完整測得全部 7 種。
+pub const BATTING_STYLE_RAW: [(bool, u8, u8); 7] = [
+    (false, 0, 0), // 滾地球型
+    (true,  0, 1), // 低仰角
+    (true,  1, 3), // 中仰角
+    (false, 2, 4), // 高仰角
+    (false, 1, 2), // 平飛球強襲
+    (true,  2, 5), // 力量型打者
+    (false, 3, 6), // 全壘打藝術家
+];
+
+pub fn batting_style_name(v: u8) -> &'static str {
+    BATTING_STYLE_NAMES.get(v as usize).copied().unwrap_or("未知組合")
+}
+
+/// 從三個實際欄位判定目前打擊姿勢；不認識的組合回 None。
+pub fn batting_style_from_raw(c2c: u8, c2d: u8, fb6: u8) -> Option<u8> {
+    let key = (c2c & 0x80 != 0, c2d & 0x03, fb6 & 0x07);
+    BATTING_STYLE_RAW.iter().position(|&x| x == key).map(|i| i as u8)
+}
+
+/// 寫入栄冠打擊姿勢。
+/// +0x2C 只動 bit7（bit4~6 是捕手配球）；+0x2D 只動 low2；+0xFB6 只動 low3。
+/// 三欄都採 read-modify-write，保留各自未確認的其他 bits。
+pub fn write_batting_style(p: &Proc, obj: usize, style: u8) -> bool {
+    let Some(&(bit7, d, sync)) = BATTING_STYLE_RAW.get(style as usize) else {
+        return false;
+    };
+
+    let c2c = p.u8_at(obj + OFF_CATCH);
+    let n2c = if bit7 { c2c | 0x80 } else { c2c & !0x80 };
+
+    let c2d = p.u8_at(obj + OFF_BATTING_STYLE);
+    let n2d = (c2d & !0x03) | (d & 0x03);
+
+    let cfb6 = p.u8_at(obj + OFF_BATTING_SYNC);
+    let nfb6 = (cfb6 & !0x07) | (sync & 0x07);
+
+    p.write(obj + OFF_CATCH, &[n2c])
+        && p.write(obj + OFF_BATTING_STYLE, &[n2d])
+        && p.write(obj + OFF_BATTING_SYNC, &[nfb6])
+}
+
 /// 捕手配球（G~S）＝ `+0x2C` 的 **bit4~6**（3 bits，0=G … 7=S）。
 ///
 /// ⚠ 同一個 byte 的其他 bit 是別的旗標（實測 bit7 大多為 1），寫入務必讀-改-寫。
@@ -2280,6 +2608,19 @@ pub fn pos_of(p: &Proc, obj: usize) -> u8 {
 
 pub const POS_NAMES: [&str; 9] = ["P", "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF"];
 
+/// 寫入主要守備位置（0=P … 8=RF）。
+/// `+0xA30` 只有 bit3~6 是位置，其他 bit 屬於同一區塊的其他欄位，必須保留。
+/// 超出已確認的 0..=8 一律拒絕，避免把未定義位置寫進存檔物件。
+pub fn write_pos(p: &Proc, obj: usize, v: u8) -> bool {
+    if v as usize >= POS_NAMES.len() {
+        return false;
+    }
+    let cur = p.u16_at(obj + OFF_POS);
+    let mask = 0xFu16 << POS_SHIFT;
+    let nv = (cur & !mask) | (((v as u16) << POS_SHIFT) & mask);
+    p.write(obj + OFF_POS, &nv.to_le_bytes())
+}
+
 /// 介面滑桿的上限 ＝ 遊戲實際承認的上限。
 /// 球速 175：patch 掉程式碼上限後資料能到 207，但**實戰投出來仍然是 175**，沒有意義。
 /// 能力值 99：換算函式自己就 `min(…, 0x63)`。
@@ -2318,12 +2659,16 @@ mod player_tests {
         b[OFF_PACK] = pack as u8;
         b[OFF_PACK + 1] = (pack >> 8) as u8;
         b[OFF_CATCH] = (7 << CATCH_SHIFT) | 0x80; // 捕手配球 S ＋ 同 byte 的別的旗標
+        b[OFF_BATTING_AGGRESSION] = 4 | 0xA0; // 打擊積極性 C ＋ 其他旗標
+        b[OFF_BATTING_AGGRESSION_SYNC] = 3 | 0xA0;
+        b[OFF_PLATE_DISCIPLINE] = (4 << PLATE_DISCIPLINE_SHIFT) | 0x85; // 選球眼 C ＋ 其他旗標
+        b[OFF_PLATE_DISCIPLINE_SYNC] = 0xA0 | 3; // C 的同步值 3 ＋ 高位其他旗標
         b[OFF_GRADE] = 3;
         b[OFF_ITEM] = 1;
         b[OFF_BOOK] = 5;
         b[OFF_TEAM] = 7;
         // 守備位置 SS(5) 放在 +0xA30 的 bit3
-        let posw: u16 = 5 << POS_SHIFT;
+        let posw: u16 = (5 << POS_SHIFT) | POPULARITY_ON as u16;
         b[OFF_POS] = posw as u8;
         b[OFF_POS + 1] = (posw >> 8) as u8;
         // 九宮格：第 0 格 +3、第 1 格 −3
@@ -2357,6 +2702,9 @@ mod player_tests {
         assert_eq!(pl.stamina, 83);
         assert_eq!(pl.pack_hi, 0xC000, "bit14-15 的旗標要原樣保留");
         assert_eq!(pl.catcher, 7, "捕手配球只能取 bit4~6，不能被同 byte 的旗標污染");
+        assert_eq!(pl.batting_aggression, 4, "打擊積極性 C 應由 +0xA5B low3 解析");
+        assert_eq!(pl.plate_discipline, 4, "選球眼 C 應由 +0xA53 bit3~5 解析");
+        assert!(pl.popularity, "人氣應由 +0xA30 low3=2 解析");
         assert_eq!(pl.pos, 5);
         assert_eq!(pl.team, 7);
         assert_eq!(pl.grade, 3);
@@ -2385,6 +2733,10 @@ mod player_tests {
             ("姓名", OFF_NAME + 64),
             ("隊伍", OFF_TEAM + 1),
             ("守備位置", OFF_POS + 2),
+            ("打擊積極性", OFF_BATTING_AGGRESSION + 1),
+            ("打擊積極性同步", OFF_BATTING_AGGRESSION_SYNC + 1),
+            ("選球眼", OFF_PLATE_DISCIPLINE + 1),
+            ("選球眼同步", OFF_PLATE_DISCIPLINE_SYNC + 1),
             ("九宮格", OFF_ZONE + 4),
             ("年級", OFF_GRADE + 1),
             ("書籍", OFF_BOOK + 1),

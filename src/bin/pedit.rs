@@ -208,10 +208,40 @@ enum Mode {
     Star,
 }
 
+/// 栄冠左側名單的顯示方式。
+/// Sorted ＝ 既有的守備位置／能力排序；Raw ＝ roster array 原始 index 順序。
+#[derive(PartialEq, Clone, Copy)]
+enum KoshienRosterView {
+    Sorted,
+    Raw,
+}
+
+/// 能力研究用的選手物件記憶體快照。
+#[derive(Clone)]
+struct ResearchSnapshot {
+    addr: usize,
+    name: String,
+    data: Vec<u8>,
+}
+
+#[derive(Clone, Copy)]
+struct ResearchDiff {
+    off: usize,
+    before: u8,
+    after: u8,
+    xor: u8,
+}
+
+
 struct App {
     proc: Option<Proc>,
     err: String,
     mode: Mode,
+    koshien_roster_view: KoshienRosterView,
+    /// 榮冠 roster 尚未出現時，每 1 秒重試一次。
+    last_koshien_retry: std::time::Instant,
+    /// roster 已取得後，每 5 秒做一次輕量有效性檢查。
+    last_koshien_validate: std::time::Instant,
     filter: String,
     list: Vec<Player>,
     sel: Option<usize>,
@@ -239,6 +269,21 @@ struct App {
     growth_target: i32,
     /// 目前選中選手的成長經驗值結構（在 reload_current 時算好, 不要每幀重算）
     growth_base: Option<usize>,
+    /// 能力研究：修改前快照。只存在修改器 RAM，不會寫回遊戲。
+    research_before: Option<ResearchSnapshot>,
+    /// 能力研究：最近一次比較結果。
+    research_diffs: Vec<ResearchDiff>,
+    /// 快照讀取長度。0x2000 比目前已知 PLAYER_READ(0x1520) 多留一些空間，
+    /// 仍可在 UI 改成已知範圍或更大的研究範圍。
+    research_len: usize,
+    /// 差分顯示時只看「恰好一個 bit 改變」的 byte，能快速排除大量計數器/數值變化。
+    research_single_bit_only: bool,
+    /// 任意 offset 研究工具：相對於目前選手物件的 offset（十六進位文字）。
+    research_offset_text: String,
+    /// 任意 offset 研究工具：準備寫入的單一 byte（十六進位文字）。
+    research_value_text: String,
+    /// 最近一次載入：(選手物件位址, offset, 原始值)。切換選手後不允許沿用。
+    research_loaded_byte: Option<(usize, usize, u8)>,
     cheats: Arc<Cheats>,
 }
 
@@ -254,6 +299,9 @@ impl App {
             proc,
             err,
             mode: Mode::Koshien,
+            koshien_roster_view: KoshienRosterView::Sorted,
+            last_koshien_retry: std::time::Instant::now(),
+            last_koshien_validate: std::time::Instant::now(),
             filter: String::new(),
             list: Vec::new(),
             sel: None,
@@ -273,6 +321,13 @@ impl App {
             only_pitchers: false,
             growth_target: 99,
             growth_base: None,
+            research_before: None,
+            research_diffs: Vec::new(),
+            research_len: 0x2000,
+            research_single_bit_only: true,
+            research_offset_text: "0x002D".into(),
+            research_value_text: String::new(),
+            research_loaded_byte: None,
             cheats: Arc::new(Cheats::default()),
         };
         spawn_cheat_worker(app.cheats.clone());
@@ -318,6 +373,74 @@ impl App {
                 false
             }
         }
+    }
+
+    /// 榮冠新版 roster 的 +0x20 child pointer 會隨遊戲畫面狀態切換。
+    /// 因此修改器若比球員名單更早啟動，第一次讀不到 roster 是正常狀況。
+    ///
+    /// - 尚未取得名單：每 1 秒重試，成功後停止高頻重試。
+    /// - 已取得名單：每 5 秒確認 roster pointer / 姓名仍有效。
+    /// - 遊戲重開或 Player Object 搬家：自動重新附加／重新載入。
+    fn auto_refresh_koshien(&mut self, ctx: &egui::Context) {
+        if self.mode != Mode::Koshien {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+
+        if self.list.is_empty() {
+            if now.duration_since(self.last_koshien_retry) >= std::time::Duration::from_secs(1) {
+                self.last_koshien_retry = now;
+                self.reload_list();
+                if !self.list.is_empty() {
+                    self.status = format!("已自動取得榮冠部員名單（{} 人）", self.list.len());
+                }
+            }
+            // 即使視窗沒有輸入事件，也要讓下一次自動重試能準時執行。
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+
+        if now.duration_since(self.last_koshien_validate) < std::time::Duration::from_secs(5) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            return;
+        }
+        self.last_koshien_validate = now;
+
+        // 遊戲真正重開：舊 handle 已失效，直接走 reload_list()，其中 ensure_proc() 會重新附加。
+        if !self.proc_alive() {
+            self.reload_list();
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+
+        let needs_reload = match &self.proc {
+            Some(p) => {
+                let objs = koshien_roster(p);
+                if objs.is_empty() {
+                    // 可能只是暫時離開 roster 有效畫面。保留現有清單，不要讓 UI 閃成空白。
+                    false
+                } else {
+                    let pointers_changed = objs.len() != self.list.len()
+                        || objs.iter().zip(self.list.iter()).any(|(&a, pl)| a != pl.addr);
+                    let first_name_changed = objs.first().is_some_and(|&a| {
+                        let live = read_name(p, a);
+                        self.list.first().is_some_and(|pl| live != pl.name || !sane_name(&live))
+                    });
+                    pointers_changed || first_name_changed
+                }
+            }
+            None => true,
+        };
+
+        if needs_reload {
+            self.reload_list();
+            if !self.list.is_empty() {
+                self.status = format!("偵測到榮冠名單更新，已自動重新載入（{} 人）", self.list.len());
+            }
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_secs(5));
     }
 
     fn reload_list(&mut self) {
@@ -482,6 +605,262 @@ impl App {
         };
     }
 
+    /// 能力研究：對目前選中的選手記錄修改前快照。
+    fn research_capture_before(&mut self) {
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "記錄失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        match p.read(obj, self.research_len) {
+            Some(data) if !data.is_empty() => {
+                let got = data.len();
+                self.research_before = Some(ResearchSnapshot {
+                    addr: obj,
+                    name: name.clone(),
+                    data,
+                });
+                self.research_diffs.clear();
+                self.status = format!(
+                    "能力研究：已記錄「{name}」修改前快照 {got:#x} bytes（物件 {obj:#x}）"
+                );
+            }
+            _ => self.status = "能力研究：讀取修改前快照失敗".into(),
+        }
+    }
+
+    /// 能力研究：讀取目前記憶體並與修改前快照比較。
+    fn research_compare_after(&mut self) {
+        let before = match self.research_before.clone() {
+            Some(v) => v,
+            None => {
+                self.status = "請先按「① 記錄修改前」".into();
+                return;
+            }
+        };
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        if obj != before.addr || name != before.name {
+            self.status = format!(
+                "能力研究：目前選中的是「{name}」({obj:#x})，不是快照中的「{}」({:#x})；請重新記錄修改前",
+                before.name, before.addr
+            );
+            return;
+        }
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "比較失敗：選手位址已失效；請重新整理後重新做一輪實驗".into();
+            return;
+        }
+        let after = match p.read(obj, before.data.len()) {
+            Some(v) if !v.is_empty() => v,
+            _ => {
+                self.status = "能力研究：讀取修改後快照失敗".into();
+                return;
+            }
+        };
+        let n = before.data.len().min(after.len());
+        self.research_diffs.clear();
+        self.research_diffs.reserve(64);
+        for i in 0..n {
+            let a = before.data[i];
+            let b = after[i];
+            if a != b {
+                self.research_diffs.push(ResearchDiff {
+                    off: i,
+                    before: a,
+                    after: b,
+                    xor: a ^ b,
+                });
+            }
+        }
+        self.status = format!(
+            "能力研究：比較完成，共 {} 個 byte 有變化（掃描 {n:#x} bytes）",
+            self.research_diffs.len()
+        );
+    }
+
+    /// 把修改前快照與差分文字輸出到 exe 同層，方便保存實驗或傳給別人分析。
+    fn research_export(&mut self) {
+        let before = match self.research_before.as_ref() {
+            Some(v) => v,
+            None => {
+                self.status = "沒有可匯出的能力研究快照".into();
+                return;
+            }
+        };
+        let dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let base = format!("research_{stamp}");
+        let bin = dir.join(format!("{base}_before.bin"));
+        let txt = dir.join(format!("{base}_diff.txt"));
+        let mut report = String::new();
+        report.push_str(&format!(
+            "player={}\naddr={:#x}\nbytes={:#x}\ndiff_count={}\n\n",
+            before.name,
+            before.addr,
+            before.data.len(),
+            self.research_diffs.len()
+        ));
+        for d in &self.research_diffs {
+            let bit = if d.xor.count_ones() == 1 {
+                format!("bit{}", d.xor.trailing_zeros())
+            } else {
+                format!("{} bits", d.xor.count_ones())
+            };
+            report.push_str(&format!(
+                "+0x{:04X}  {:02X} -> {:02X}  XOR={:02X}  {}\n",
+                d.off, d.before, d.after, d.xor, bit
+            ));
+        }
+        let ok_bin = std::fs::write(&bin, &before.data);
+        let ok_txt = std::fs::write(&txt, report);
+        self.status = if ok_bin.is_ok() && ok_txt.is_ok() {
+            format!("能力研究已匯出：{}、{}", bin.display(), txt.display())
+        } else {
+            format!("能力研究匯出失敗：{}", dir.display())
+        };
+    }
+
+    /// 研究工具的十六進位輸入。接受 `0x002D`、`+0x002D`、`002D`。
+    fn parse_research_hex(text: &str) -> Option<usize> {
+        let t = text.trim();
+        let t = t.strip_prefix('+').unwrap_or(t);
+        let t = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")).unwrap_or(t);
+        if t.is_empty() || !t.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        usize::from_str_radix(t, 16).ok()
+    }
+
+    /// 從目前選手物件載入任意 offset 的單一 byte。
+    fn research_load_byte(&mut self) {
+        let off = match Self::parse_research_hex(&self.research_offset_text) {
+            Some(v) if v <= 0xFFFF => v,
+            _ => {
+                self.status = "Offset 格式錯誤：請輸入例如 0x002D（範圍 0x0000..0xFFFF）".into();
+                return;
+            }
+        };
+        let (obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "載入失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        match p.read(obj + off, 1).and_then(|b| b.first().copied()) {
+            Some(v) => {
+                self.research_loaded_byte = Some((obj, off, v));
+                self.research_value_text = format!("{v:02X}");
+                self.status = format!(
+                    "任意 Offset：已載入「{name}」+0x{off:04X} = 0x{v:02X}"
+                );
+            }
+            None => self.status = format!("任意 Offset：讀取 +0x{off:04X} 失敗"),
+        }
+    }
+
+    /// 把研究工具輸入的單一 byte 寫回目前選手物件。
+    fn research_write_byte(&mut self) {
+        let (obj, off, old) = match self.research_loaded_byte {
+            Some(v) => v,
+            None => {
+                self.status = "請先按「載入」確認目前 offset 與原始值".into();
+                return;
+            }
+        };
+        let (cur_obj, name) = match self.cur.as_ref() {
+            Some(pl) => (pl.addr, pl.name.clone()),
+            None => {
+                self.status = "請先選一位選手".into();
+                return;
+            }
+        };
+        if cur_obj != obj {
+            self.status = "目前選手已切換；請重新按「載入」後再寫入".into();
+            self.research_loaded_byte = None;
+            return;
+        }
+        // 使用者若改了 offset 輸入框，必須重新載入，避免畫面顯示 A offset 卻寫到舊的 B offset。
+        if Self::parse_research_hex(&self.research_offset_text) != Some(off) {
+            self.status = "Offset 已變更；請重新按「載入」再寫入".into();
+            return;
+        }
+        let nv = match Self::parse_research_hex(&self.research_value_text) {
+            Some(v) if v <= 0xFF => v as u8,
+            _ => {
+                self.status = "數值格式錯誤：請輸入 00..FF（十六進位）".into();
+                return;
+            }
+        };
+        let p = match self.proc.as_ref() {
+            Some(p) => p,
+            None => {
+                self.status = "尚未附加遊戲行程".into();
+                return;
+            }
+        };
+        let live = read_name(p, obj);
+        if live != name || !sane_name(&live) {
+            self.status = "寫入失敗：選手位址已失效，請先重新整理".into();
+            return;
+        }
+        let ok = p.write(obj + off, &[nv]);
+        if ok {
+            self.research_loaded_byte = Some((obj, off, nv));
+            self.status = format!(
+                "任意 Offset：+0x{off:04X} 已寫入 0x{old:02X} → 0x{nv:02X}（{name}）"
+            );
+        } else {
+            self.status = format!("任意 Offset：寫入 +0x{off:04X} 失敗");
+        }
+    }
+
     fn write_ok(&mut self, ok: bool, what: &str) {
         self.status = if ok {
             format!("已寫入 {what}　※切到別的選手再切回來畫面才會重畫")
@@ -518,6 +897,32 @@ fn player_row(ui: &mut egui::Ui, pl: &Player, sel: bool, copies: usize, star: bo
             } else {
                 format!("物件 {:#x}", pl.addr)
             })
+            .clicked()
+    })
+    .inner
+}
+
+/// 栄冠「原始名單」的一列：保留 roster array 的原始 index，不做任何重新排序。
+/// 左側顯示 #00..、守備位置與姓名；hover 顯示 Player Object 位址。
+fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: bool) -> bool {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [34.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("#{index:02}")).monospace().weak()),
+        );
+        ui.add_sized(
+            [30.0, 18.0],
+            egui::Label::new(
+                egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
+            ),
+        );
+        let w = ui.available_width().max(40.0);
+        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, &pl.name))
+            .on_hover_text(format!(
+                "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
+                pos_name(pl.pos),
+                pl.addr
+            ))
             .clicked()
     })
     .inner
@@ -638,6 +1043,7 @@ fn grade_of(v: u8) -> &'static str {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.poll_scan(ctx);
+        self.auto_refresh_koshien(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -807,11 +1213,71 @@ impl eframe::App for App {
                         };
                     }
                 }
+
+                if ui.button("榮冠：所有球員情緒 → 超興奮（單次）")
+                    .on_hover_text(
+                        "把目前榮冠 roster 中所有部員的情緒一次設成「超興奮」。\n\
+                         寫入 Player Object +0xE82 = 0。\n\
+                         執行前會先完整驗證 roster count、每個 Player Object 與姓名；\n\
+                         任一項異常就整批取消，不會寫入任何球員。\n\
+                         這是單次修改；之後遊戲事件若改變情緒，需要再按一次。")
+                    .clicked()
+                {
+                    if self.ensure_proc() {
+                        let checked = self.proc.as_ref()
+                            .map(|p| validated_koshien_roster(p))
+                            .unwrap_or_else(|| Err("尚未附加遊戲".into()));
+                        match checked {
+                            Ok(roster) => {
+                                let expected = roster.len();
+                                let n = self.proc.as_ref()
+                                    .map_or(0, |p| set_koshien_all_mood(p, 0));
+                                if n == expected && n > 0 {
+                                    for pl in &mut self.list {
+                                        if roster.contains(&pl.addr) {
+                                            pl.mood = 0;
+                                        }
+                                    }
+                                    if let Some(cur) = self.cur.as_mut() {
+                                        if roster.contains(&cur.addr) {
+                                            cur.mood = 0;
+                                        }
+                                    }
+                                    self.status = format!("已將 {n} 位榮冠球員情緒設為超興奮");
+                                } else {
+                                    self.status = format!("寫入未完整完成（成功 {n}/{expected}），請重新取得名單後再試");
+                                }
+                            }
+                            Err(e) => {
+                                self.status = format!("未進行修改 —— {e}");
+                            }
+                        }
+                    }
+                }
             });
             ui.add_space(3.0);
         });
 
-        egui::SidePanel::left("list").resizable(true).default_width(230.0).show(ctx, |ui| {
+        egui::SidePanel::left("list").resizable(true).default_width(250.0).show(ctx, |ui| {
+            // 只有栄冠有固定 roster array，因此只有栄冠提供「排序／原始」兩種頁籤。
+            // 明星選手模式仍維持既有掃描結果顯示，不受此功能影響。
+            if self.mode == Mode::Koshien {
+                ui.horizontal(|ui| {
+                    ui.selectable_value(
+                        &mut self.koshien_roster_view,
+                        KoshienRosterView::Sorted,
+                        "已排序名單",
+                    );
+                    ui.selectable_value(
+                        &mut self.koshien_roster_view,
+                        KoshienRosterView::Raw,
+                        "原始名單",
+                    )
+                    .on_hover_text("完全照遊戲 roster array 的 index 0..N-1 顯示，不依守備位置重新排序");
+                });
+                ui.separator();
+            }
+
             ui.horizontal(|ui| {
                 ui.label("搜尋");
                 ui.text_edit_singleline(&mut self.filter);
@@ -819,134 +1285,159 @@ impl eframe::App for App {
             // ⚠ 原本是「球速≥120」—— 但野手的球速欄一律是 120，等於完全沒過濾。
             //   改用 +0xEB6 的守備位置。
             ui.checkbox(&mut self.only_pitchers, "只顯示投手");
-            ui.checkbox(&mut self.merge_dups, "合併同名副本")
-                .on_hover_text("同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。\n勾起來時同隊同名只留位址最小的那份，右邊會標「×份數」。\n⚠ 挑哪一份是經驗法則（12 位對照畫面值中 11 位正確），\n　 改了畫面沒反應就取消勾選、換一份試。");
+
+            // 原始名單的目的就是忠實顯示 roster index，因此不套用「合併同名副本」。
+            // 其他模式與栄冠的已排序名單維持既有行為。
+            let raw_koshien = self.mode == Mode::Koshien
+                && self.koshien_roster_view == KoshienRosterView::Raw;
+            if !raw_koshien {
+                ui.checkbox(&mut self.merge_dups, "合併同名副本")
+                    .on_hover_text("同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。\n勾起來時同隊同名只留位址最小的那份，右邊會標「×份數」。\n⚠ 挑哪一份是經驗法則（12 位對照畫面值中 11 位正確），\n　 改了畫面沒反應就取消勾選、換一份試。");
+            } else {
+                ui.weak(format!("Roster 原始順序：{} 人（index 0..{}）",
+                    self.list.len(), self.list.len().saturating_sub(1)));
+            }
             ui.separator();
+
             // auto_shrink=false：否則每列是 horizontal（內容寬），ScrollArea 會跟著縮，
             // 面板右半邊會空一大塊出來
             egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
                 let f = self.filter.trim().to_lowercase();
                 let mut newsel = None;
 
-                // 依守備位置分組（P→C→1B→2B→3B→SS→LF→CF→RF），組內能力高的在前
-                // —— 跟遊戲的部員一覽同一個排法，方便對著畫面找人。
-                // ⚠ 只排「顯示順序」，self.list 不動，否則 self.sel 這個索引會失效。
-                let mut order: Vec<usize> = (0..self.list.len())
-                    .filter(|&i| {
-                        let pl = &self.list[i];
-                        (f.is_empty() || pl.name.to_lowercase().contains(&f))
-                            && !(self.only_pitchers && pl.pos != 0)
-                    })
-                    .collect();
-                order.sort_by_key(|&i| {
-                    let pl = &self.list[i];
-                    // 投手看球速、野手看對右打擊 —— 只在組內比較, 混用不影響
-                    let strength = if pl.pos == 0 { pl.speed as i32 } else { pl.stats[0] as i32 };
-                    (pl.pos, -strength)
-                });
-
-                // ── 合併同名副本：同一位選手在記憶體裡有 2~4 份（不同世代／不同用途）。
-                //   同隊同名只留**位址最小**的那份 —— 拿 12 位選手的畫面球速/耐力比對，
-                //   這條規則 11/12 挑到畫面正在讀的那份。
-                // 查 reload 時算好的表, 每幀不做任何記憶體讀取
-                let mut copies: std::collections::HashMap<usize, usize> =
-                    std::collections::HashMap::new();
-                if self.merge_dups {
-                    order.retain(|&i| {
-                        let pl = &self.list[i];
-                        match self.dup_rep.get(&(pl.team, pl.name.clone())) {
-                            Some(&(rep, n)) if rep == i => {
-                                copies.insert(i, n);
-                                true
-                            }
-                            Some(_) => false,
-                            None => true,
+                if raw_koshien {
+                    // 栄冠原始名單：直接走 self.list 的原始 roster 順序。
+                    // 搜尋／只顯示投手只做「過濾」，絕不改變剩餘項目的 index 或次序。
+                    for (i, pl) in self.list.iter().enumerate() {
+                        if !f.is_empty() && !pl.name.to_lowercase().contains(&f) {
+                            continue;
                         }
-                    });
-                }
-
-                if self.mode == Mode::Koshien {
-                    // 栄冠只有一隊 —— 直接照守備位置分組
-                    let mut last_pos: Option<u8> = None;
-                    for i in order {
-                        if last_pos.is_some_and(|p| p != self.list[i].pos) {
-                            ui.separator();
+                        if self.only_pitchers && pl.pos != 0 {
+                            continue;
                         }
-                        last_pos = Some(self.list[i].pos);
-                        if player_row(ui, &self.list[i], self.sel == Some(i),
-                                      copies.get(&i).copied().unwrap_or(1),
-                                      self.growth_owners.contains(&i)) {
+                        if raw_koshien_player_row(ui, i, pl, self.sel == Some(i)) {
                             newsel = Some(i);
                         }
                     }
                 } else {
-                    // 明星選手：先分隊，隊內再照守備位置（order 已經排好，這裡保持穩定）
-                    let mut by_team: std::collections::BTreeMap<u8, Vec<usize>> =
-                        std::collections::BTreeMap::new();
-                    for &i in &order {
-                        by_team.entry(self.list[i].team).or_default().push(i);
-                    }
-                    for (tid, idxs) in by_team {
-                        // 沒自訂隊名時，把隊上第一位（排序後＝最強的投手）當辨識線索，
-                        // 不然一整排「隊伍 6」根本認不出誰是誰
-                        let label = match self.teams.get(&tid) {
-                            Some(n) => format!("{n}　{} 人", idxs.len()),
-                            None => format!(
-                                "隊伍 {tid}　{} 人　（{}…）",
-                                idxs.len(),
-                                self.list[idxs[0]].name
-                            ),
-                        };
-                        let mut head =
-                            egui::CollapsingHeader::new(label).id_source(("team", tid));
-                        // 搜尋中就全部展開，否則搜到的人會藏在收合的群組裡
-                        if !f.is_empty() {
-                            head = head.open(Some(true));
-                        }
-                        head.show(ui, |ui| {
-                            // 隊名：記憶體裡沒有 ID→隊名的對照表, 讓使用者自己命名並存檔
-                            if self.rename_team == Some(tid) {
-                                let r = ui.text_edit_singleline(&mut self.rename_buf);
-                                let done = r.lost_focus()
-                                    && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                                if done || ui.small_button("✔ 儲存").clicked() {
-                                    let v = self.rename_buf.trim().to_string();
-                                    if v.is_empty() {
-                                        self.teams.remove(&tid);
-                                    } else {
-                                        self.teams.insert(tid, v);
-                                    }
-                                    self.rename_team = None;
-                                    self.status = match save_teams(&teams_path(), &self.teams) {
-                                        Ok(()) => format!("已存隊名 → {}", teams_path().display()),
-                                        Err(e) => e,
-                                    };
+                    // 既有顯示方式：依守備位置分組（P→C→1B→2B→3B→SS→LF→CF→RF），
+                    // 組內能力高的在前。只排序 UI 的 order，self.list 原始順序永遠不動。
+                    let mut order: Vec<usize> = (0..self.list.len())
+                        .filter(|&i| {
+                            let pl = &self.list[i];
+                            (f.is_empty() || pl.name.to_lowercase().contains(&f))
+                                && !(self.only_pitchers && pl.pos != 0)
+                        })
+                        .collect();
+                    order.sort_by_key(|&i| {
+                        let pl = &self.list[i];
+                        let strength = if pl.pos == 0 { pl.speed as i32 } else { pl.stats[0] as i32 };
+                        (pl.pos, -strength)
+                    });
+
+                    let mut copies: std::collections::HashMap<usize, usize> =
+                        std::collections::HashMap::new();
+                    if self.merge_dups {
+                        order.retain(|&i| {
+                            let pl = &self.list[i];
+                            match self.dup_rep.get(&(pl.team, pl.name.clone())) {
+                                Some(&(rep, n)) if rep == i => {
+                                    copies.insert(i, n);
+                                    true
                                 }
-                            } else {
-                                let hint = &self.list[idxs[0]].name;
-                                if ui
-                                    .small_button(format!("✎ 命名（例如：{hint} 那一隊）"))
-                                    .on_hover_text(
-                                        "遊戲記憶體裡沒有隊伍 ID 對隊名的表, \
-                                         所以隊名要自己填一次, 之後會記在 teams.json。",
-                                    )
-                                    .clicked()
-                                {
-                                    self.rename_team = Some(tid);
-                                    self.rename_buf =
-                                        self.teams.get(&tid).cloned().unwrap_or_default();
-                                }
-                            }
-                            for &i in &idxs {
-                                if player_row(ui, &self.list[i], self.sel == Some(i),
-                                      copies.get(&i).copied().unwrap_or(1),
-                                      self.growth_owners.contains(&i)) {
-                                    newsel = Some(i);
-                                }
+                                Some(_) => false,
+                                None => true,
                             }
                         });
                     }
+
+                    if self.mode == Mode::Koshien {
+                        let mut last_pos: Option<u8> = None;
+                        for i in order {
+                            if last_pos.is_some_and(|p| p != self.list[i].pos) {
+                                ui.separator();
+                            }
+                            last_pos = Some(self.list[i].pos);
+                            if player_row(
+                                ui,
+                                &self.list[i],
+                                self.sel == Some(i),
+                                copies.get(&i).copied().unwrap_or(1),
+                                self.growth_owners.contains(&i),
+                            ) {
+                                newsel = Some(i);
+                            }
+                        }
+                    } else {
+                        // 明星選手：完全維持原本的「先分隊、隊內依守備位置」顯示方式。
+                        let mut by_team: std::collections::BTreeMap<u8, Vec<usize>> =
+                            std::collections::BTreeMap::new();
+                        for &i in &order {
+                            by_team.entry(self.list[i].team).or_default().push(i);
+                        }
+                        for (tid, idxs) in by_team {
+                            let label = match self.teams.get(&tid) {
+                                Some(n) => format!("{n}　{} 人", idxs.len()),
+                                None => format!(
+                                    "隊伍 {tid}　{} 人　（{}…）",
+                                    idxs.len(),
+                                    self.list[idxs[0]].name
+                                ),
+                            };
+                            let mut head =
+                                egui::CollapsingHeader::new(label).id_source(("team", tid));
+                            if !f.is_empty() {
+                                head = head.open(Some(true));
+                            }
+                            head.show(ui, |ui| {
+                                if self.rename_team == Some(tid) {
+                                    let r = ui.text_edit_singleline(&mut self.rename_buf);
+                                    let done = r.lost_focus()
+                                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                                    if done || ui.small_button("✔ 儲存").clicked() {
+                                        let v = self.rename_buf.trim().to_string();
+                                        if v.is_empty() {
+                                            self.teams.remove(&tid);
+                                        } else {
+                                            self.teams.insert(tid, v);
+                                        }
+                                        self.rename_team = None;
+                                        self.status = match save_teams(&teams_path(), &self.teams) {
+                                            Ok(()) => format!("已存隊名 → {}", teams_path().display()),
+                                            Err(e) => e,
+                                        };
+                                    }
+                                } else {
+                                    let hint = &self.list[idxs[0]].name;
+                                    if ui
+                                        .small_button(format!("✎ 命名（例如：{hint} 那一隊）"))
+                                        .on_hover_text(
+                                            "遊戲記憶體裡沒有隊伍 ID 對隊名的表, \
+                                             所以隊名要自己填一次, 之後會記在 teams.json。",
+                                        )
+                                        .clicked()
+                                    {
+                                        self.rename_team = Some(tid);
+                                        self.rename_buf =
+                                            self.teams.get(&tid).cloned().unwrap_or_default();
+                                    }
+                                }
+                                for &i in &idxs {
+                                    if player_row(
+                                        ui,
+                                        &self.list[i],
+                                        self.sel == Some(i),
+                                        copies.get(&i).copied().unwrap_or(1),
+                                        self.growth_owners.contains(&i),
+                                    ) {
+                                        newsel = Some(i);
+                                    }
+                                }
+                            });
+                        }
+                    }
                 }
+
                 if let Some(i) = newsel {
                     self.sel = Some(i);
                     self.reload_current();
@@ -1000,7 +1491,17 @@ impl App {
                     .unwrap_or_else(|| format!("隊伍 {}", cur.team));
                 ui.label(t);
             }
-            ui.label(format!("物件 {obj:#x}"));
+            // 選中任何球員後都直接顯示實際 Player Object 位址。
+            // 栄冠模式下 self.sel 仍是原始 roster array 的索引，即使左側目前採守備位置排序。
+            if self.mode == Mode::Koshien {
+                if let Some(i) = self.sel {
+                    ui.monospace(format!("Roster #{i:02}  |  Player Object: 0x{obj:X}"));
+                } else {
+                    ui.monospace(format!("Player Object: 0x{obj:X}"));
+                }
+            } else {
+                ui.monospace(format!("Player Object: 0x{obj:X}"));
+            }
             if ui.button("重新讀取").clicked() {
                 act = Some((true, "（重新讀取）".into()));
             }
@@ -1105,6 +1606,222 @@ impl App {
                 }
             }
         });
+        ui.separator();
+
+        // ── 能力研究：記錄同一位選手「學技能前 / 學技能後」的物件記憶體並做 byte/bit 差分。
+        egui::CollapsingHeader::new("🔬 能力研究／記憶體差分")
+            .default_open(self.mode == Mode::Koshien)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "用法：先按①記錄目前狀態 → 回遊戲只讓這位選手取得一個目標能力 →\n\
+                         回來按②比較。修改器會列出物件內所有改變的 offset / byte / bit。"
+                    )
+                    .small(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("掃描範圍");
+                    egui::ComboBox::from_id_source("research_len")
+                        .selected_text(format!("+0x0000 ～ +0x{:04X}", self.research_len))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                PLAYER_READ,
+                                format!("已知選手物件 0x{PLAYER_READ:X}"),
+                            );
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                0x2000,
+                                "擴充 0x2000（建議）",
+                            );
+                            ui.selectable_value(
+                                &mut self.research_len,
+                                0x4000,
+                                "擴充 0x4000（較多雜訊）",
+                            );
+                        });
+                    ui.checkbox(
+                        &mut self.research_single_bit_only,
+                        "結果只顯示單一 bit 變化",
+                    )
+                    .on_hover_text(
+                        "找旗標型能力時最有用。完整差分仍保留，可取消勾選查看全部。",
+                    );
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("① 記錄修改前").clicked() {
+                        self.research_capture_before();
+                    }
+                    let can_compare = self.research_before.is_some();
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("② 記錄修改後並比較"))
+                        .clicked()
+                    {
+                        self.research_compare_after();
+                    }
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("匯出快照 / 差分"))
+                        .clicked()
+                    {
+                        self.research_export();
+                    }
+                    if ui
+                        .add_enabled(can_compare, egui::Button::new("清除研究資料"))
+                        .clicked()
+                    {
+                        self.research_before = None;
+                        self.research_diffs.clear();
+                        self.status = "能力研究資料已清除".into();
+                    }
+                });
+
+                if let Some(snap) = self.research_before.as_ref() {
+                    let same = snap.addr == obj && snap.name == cur.name;
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "修改前快照：{}　物件 {:#x}　{} bytes{}",
+                            snap.name,
+                            snap.addr,
+                            snap.data.len(),
+                            if same { "" } else { "　⚠ 目前選手不同" }
+                        ))
+                        .small()
+                        .color(if same {
+                            egui::Color32::from_rgb(80, 200, 120)
+                        } else {
+                            egui::Color32::from_rgb(240, 170, 60)
+                        }),
+                    );
+                }
+
+                ui.separator();
+                ui.label(egui::RichText::new("任意 Offset 讀寫（研究用）").strong());
+                ui.label(
+                    egui::RichText::new(
+                        "相對於目前選手物件讀寫 1 byte。適合驗證差分找到的欄位，例如 +0x002D。\n\
+                         ⚠ 寫錯 offset / 數值可能造成遊戲異常；先載入確認，再一次只改一個 byte。"
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Offset");
+                    ui.add_sized(
+                        [90.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.research_offset_text)
+                            .hint_text("0x002D")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    if ui.button("載入").clicked() {
+                        self.research_load_byte();
+                    }
+                    ui.label("Value (hex)");
+                    ui.add_sized(
+                        [54.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.research_value_text)
+                            .hint_text("00")
+                            .font(egui::TextStyle::Monospace),
+                    );
+                    let loaded_here = self
+                        .research_loaded_byte
+                        .is_some_and(|(a, _, _)| a == obj);
+                    if ui
+                        .add_enabled(loaded_here, egui::Button::new("寫入 1 byte"))
+                        .on_hover_text("只寫入這個 offset 的 1 byte；切換選手或修改 offset 後必須重新載入。")
+                        .clicked()
+                    {
+                        self.research_write_byte();
+                    }
+                    if let Some((a, off, v)) = self.research_loaded_byte {
+                        if a == obj {
+                            ui.monospace(format!("已載入 +0x{off:04X} = {v:02X}"));
+                        } else {
+                            ui.weak("已切換選手，請重新載入");
+                        }
+                    }
+                });
+
+                if !self.research_diffs.is_empty() {
+                    let shown = self
+                        .research_diffs
+                        .iter()
+                        .filter(|d| {
+                            !self.research_single_bit_only || d.xor.count_ones() == 1
+                        })
+                        .count();
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "差分 {} 個 byte；目前顯示 {} 個",
+                            self.research_diffs.len(),
+                            shown
+                        ))
+                        .strong(),
+                    );
+                    egui::ScrollArea::vertical()
+                        .max_height(260.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("research_diff_grid")
+                                .num_columns(6)
+                                .striped(true)
+                                .spacing([10.0, 3.0])
+                                .show(ui, |ui| {
+                                    ui.strong("Offset");
+                                    ui.strong("修改前");
+                                    ui.strong("修改後");
+                                    ui.strong("XOR");
+                                    ui.strong("bit");
+                                    ui.strong("備註");
+                                    ui.end_row();
+                                    for d in &self.research_diffs {
+                                        if self.research_single_bit_only
+                                            && d.xor.count_ones() != 1
+                                        {
+                                            continue;
+                                        }
+                                        let bits = if d.xor.count_ones() == 1 {
+                                            format!("bit{}", d.xor.trailing_zeros())
+                                        } else {
+                                            let mut v = Vec::new();
+                                            for b in 0..8 {
+                                                if d.xor >> b & 1 == 1 {
+                                                    v.push(format!("{b}"));
+                                                }
+                                            }
+                                            format!("bits {}", v.join(","))
+                                        };
+                                        let note = if (OFF_ABIL2..OFF_ABIL2 + ABIL_BYTES)
+                                            .contains(&d.off)
+                                        {
+                                            "既有特殊能力區"
+                                        } else if d.off == OFF_POS || d.off == OFF_POS + 1 {
+                                            "主要守位欄位"
+                                        } else {
+                                            ""
+                                        };
+                                        ui.monospace(format!("+0x{:04X}", d.off));
+                                        ui.monospace(format!("{:02X}", d.before));
+                                        ui.monospace(format!("{:02X}", d.after));
+                                        ui.monospace(format!("{:02X}", d.xor));
+                                        ui.monospace(bits);
+                                        if note.is_empty() {
+                                            ui.label("");
+                                        } else {
+                                            ui.weak(note);
+                                        }
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                    ui.label(
+                        egui::RichText::new(
+                            "判讀建議：同一能力換 2～3 位選手重複實驗；固定出現的相同 offset/bit 才值得認定。",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
         ui.separator();
 
         // ── 成長經驗值（★ 明星選手模式的能力值真正來源）
@@ -1235,6 +1952,130 @@ impl App {
             ui.separator();
         }
 
+        // ── 個人特質（栄冠專用）
+        if self.mode == Mode::Koshien {
+            egui::CollapsingHeader::new("個人特質").default_open(true).show(ui, |ui| {
+                egui::Grid::new("personal_traits").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                    // 信賴度：u8，遊戲有效上限 0xC8 = 200。
+                    ui.label("信賴度").on_hover_text("Player Object +0xE80 / u8 / 0～200");
+                    ui.horizontal(|ui| {
+                        let mut v = cur.trust.min(200);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=200).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=200).speed(1.0)).changed();
+                        if slider_changed || input_changed {
+                            cur.trust = v.min(200);
+                            let ok = P!().write(obj + OFF_TRUST, &[cur.trust]);
+                            act = Some((ok, format!("信賴度 → {}", cur.trust)));
+                        }
+                    });
+                    ui.end_row();
+
+                    const PERSONALITY_NAMES: [&str; 8] = [
+                        "非常普通", "調皮型", "熱血男兒", "冷靜型",
+                        "內向", "天才", "人來瘋", "精明幹練",
+                    ];
+                    ui.label("性格");
+                    let old = cur.personality;
+                    let shown = PERSONALITY_NAMES.get(cur.personality as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("personality", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in PERSONALITY_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.personality, v as u8, *name);
+                            }
+                        });
+                    if cur.personality != old {
+                        let ok = P!().write(obj + OFF_PERSONALITY, &[cur.personality]);
+                        act = Some((ok, format!("性格 → {}", PERSONALITY_NAMES[cur.personality as usize])));
+                    }
+                    ui.end_row();
+
+                    const MOOD_NAMES: [&str; 4] = ["超興奮", "興奮", "普通", "消沉"];
+                    ui.label("情緒");
+                    let old = cur.mood;
+                    let shown = MOOD_NAMES.get(cur.mood as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("mood", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in MOOD_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.mood, v as u8, *name);
+                            }
+                        });
+                    if cur.mood != old {
+                        let ok = P!().write(obj + OFF_MOOD, &[cur.mood]);
+                        act = Some((ok, format!("情緒 → {}", MOOD_NAMES[cur.mood as usize])));
+                    }
+                    ui.end_row();
+
+                    // 體力：u16 little-endian，遊戲有效上限 0x01F4 = 500。
+                    ui.label("體力").on_hover_text("Player Object +0xE86 / u16 / 0～500（0x0000～0x01F4）");
+                    ui.horizontal(|ui| {
+                        let mut v = cur.energy.min(500);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=500).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=500).speed(1.0)).changed();
+                        if slider_changed || input_changed {
+                            cur.energy = v.min(500);
+                            let ok = P!().write(obj + OFF_ENERGY, &cur.energy.to_le_bytes());
+                            act = Some((ok, format!("體力 → {}", cur.energy)));
+                        }
+                    });
+                    ui.end_row();
+
+                    // 學力儲存的是連續數值，UI 依實測區間轉成 Rank。
+                    // 選擇 Rank 時寫入該區間最高值。
+                    const ACADEMIC_NAMES: [&str; 5] = ["E", "D", "C", "B", "A"];
+                    const ACADEMIC_WRITE: [u8; 5] = [0x23, 0x2D, 0x37, 0x41, 0x4B];
+                    let mut rank: u8 = match cur.academic {
+                        0x00..=0x23 => 0,
+                        0x24..=0x2D => 1,
+                        0x2E..=0x37 => 2,
+                        0x38..=0x41 => 3,
+                        0x42..=0x4B => 4,
+                        _ => 0xFF,
+                    };
+                    ui.label("學力").on_hover_text(format!("目前實際值：0x{:02X}", cur.academic));
+                    let old_rank = rank;
+                    let shown = ACADEMIC_NAMES.get(rank as usize).copied().unwrap_or("未知");
+                    egui::ComboBox::from_id_source(("academic", obj))
+                        .selected_text(shown).width(110.0).show_ui(ui, |ui| {
+                            for (v, name) in ACADEMIC_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut rank, v as u8, *name);
+                            }
+                        });
+                    if rank != old_rank && (rank as usize) < ACADEMIC_WRITE.len() {
+                        cur.academic = ACADEMIC_WRITE[rank as usize];
+                        let ok = P!().write(obj + OFF_ACADEMIC, &[cur.academic]);
+                        act = Some((ok, format!("學力 → {}", ACADEMIC_NAMES[rank as usize])));
+                    }
+                    ui.end_row();
+
+                    // 招募評價：u16，0..=0x01FF；星數只是遊戲 UI 的區間顯示。
+                    let stars = match cur.recruit_eval.min(0x01FF) {
+                        0x0000..=0x0027 => 1,
+                        0x0028..=0x004F => 2,
+                        0x0050..=0x009F => 3,
+                        0x00A0..=0x00EF => 4,
+                        _ => 5,
+                    };
+                    ui.label("招募評價").on_hover_text(format!(
+                        "Player Object +0xE8C / u16 / 0～511（0x0000～0x01FF）\n目前：{}★",
+                        stars
+                    ));
+                    ui.horizontal(|ui| {
+                        let mut v = cur.recruit_eval.min(511);
+                        let slider_changed = ui.add(egui::Slider::new(&mut v, 0..=511).show_value(false)).changed();
+                        let input_changed = ui.add(egui::DragValue::new(&mut v).range(0..=511).speed(1.0)).changed();
+                        ui.label("★".repeat(stars));
+                        if slider_changed || input_changed {
+                            cur.recruit_eval = v.min(511);
+                            let ok = P!().write(obj + OFF_RECRUIT_EVAL, &cur.recruit_eval.to_le_bytes());
+                            act = Some((ok, format!("招募評價 → {}", cur.recruit_eval)));
+                        }
+                    });
+                    ui.end_row();
+                });
+            });
+            ui.separator();
+        }
+
         // ── 基本
         egui::CollapsingHeader::new("基本").default_open(true).show(ui, |ui| {
             egui::Grid::new("basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
@@ -1264,6 +2105,60 @@ impl App {
                     act = Some((ok, "投手適性（含經驗值）".into()));
                 }
                 ui.end_row();
+
+                // 栄冠：主要守備位置（+0xA30 bit3~6）。
+                // 只改「主要位置」本身，不會自動改下方各守位適性。
+                if self.mode == Mode::Koshien {
+                    ui.label("主要守備位置")
+                        .on_hover_text("栄冠部員一覽與選手標題使用的主要守備位置。\n\
+                                        存在 +0xA30 的 bit3~6；寫入時會保留同一 u16 的其他旗標。\n\
+                                        ※ 只改主要位置，不會自動提高該守位適性；需要時請再調整下方守位適性。");
+                    let old_pos = cur.pos;
+                    egui::ComboBox::from_id_source(("main_pos", obj))
+                        .selected_text(pos_name(cur.pos))
+                        .width(90.0)
+                        .show_ui(ui, |ui| {
+                            for (v, name) in POS_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.pos, v as u8, *name);
+                            }
+                        });
+                    if cur.pos != old_pos {
+                        let ok = write_pos(P!(), obj, cur.pos);
+                        if ok {
+                            // 左側清單是 self.list 的快照；同步更新，讓位置圖示與分組立即一致。
+                            if let Some(i) = self.sel {
+                                if let Some(pl) = self.list.get_mut(i) {
+                                    pl.pos = cur.pos;
+                                }
+                            }
+                        }
+                        act = Some((ok, format!("主要守備位置 → {}", pos_name(cur.pos))));
+                    }
+                    ui.end_row();
+                }
+
+                // 栄冠：打擊姿勢。三欄聯合編碼（+0x2C bit7 / +0x2D low2 / +0xFB6 low3）。
+                // 只在栄冠顯示：目前映射只在栄冠球員上完成交叉驗證。
+                if self.mode == Mode::Koshien {
+                    ui.label("打擊姿勢")
+                        .on_hover_text("已實測的 7 種打球型態。選擇後會同步修改：\n\
+                                        +0x2C bit7、+0x2D low2、+0xFB6 low3。\n\
+                                        每一處都只改已確認的 bits，其他旗標（包含捕手配球）會保留。");
+                    let old_style = cur.batting_style;
+                    egui::ComboBox::from_id_source(("batting_style", obj))
+                        .selected_text(batting_style_name(cur.batting_style))
+                        .width(130.0)
+                        .show_ui(ui, |ui| {
+                            for (v, name) in BATTING_STYLE_NAMES.iter().enumerate() {
+                                ui.selectable_value(&mut cur.batting_style, v as u8, *name);
+                            }
+                        });
+                    if cur.batting_style != old_style && cur.batting_style != BATTING_STYLE_UNKNOWN {
+                        let ok = write_batting_style(P!(), obj, cur.batting_style);
+                        act = Some((ok, format!("打擊姿勢 → {}", batting_style_name(cur.batting_style))));
+                    }
+                    ui.end_row();
+                }
 
                 // 8 個野手守位（+0x18..0x1F）。⚠ 只寫顯示值撐不住 ——
                 // 沒練的守位看起來正常, 一旦在遊戲內練它就會依經驗值被算回 G,
@@ -1309,6 +2204,7 @@ impl App {
                     act = Some((ok, "書籍使用次數".into()));
                 }
                 ui.end_row();
+
             });
             if ui.button("道具/書籍使用次數歸零（＝無限使用）").clicked() {
                 cur.item = 0;
@@ -1439,6 +2335,59 @@ impl App {
                     ui.end_row();
                 }
             });
+
+            // ── 野手風格：已實測確認「打擊積極性／選球眼」G~A，以及「人氣」旗標。
+            // 顯示方式沿用捕手配球的 grade_btn：左鍵升一級，右鍵直接選。
+            if self.mode == Mode::Koshien {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label(egui::RichText::new("野手風格").strong());
+                egui::Grid::new("fielder_style").num_columns(2).spacing([10.0, 4.0]).show(ui, |ui| {
+                    const FIELDER_GRADE_OPTS: [(u8, &str); 7] = [
+                        (0, "G"), (1, "F"), (2, "E"), (3, "D"),
+                        (4, "C"), (5, "B"), (6, "A"),
+                    ];
+
+                    ui.label("打擊積極性")
+                        .on_hover_text(
+                            "栄冠模式實測：G~A（沒有 S）。\n\
+                             顯示等級在 +0xA5B low3，同步值在 +0x10AE low3；\n\
+                             修改時會同步寫兩處，其他 bits 原樣保留。"
+                        );
+                    if let Some(g) = grade_btn(ui, cur.batting_aggression, &FIELDER_GRADE_OPTS, 52.0) {
+                        cur.batting_aggression = g;
+                        let ok = write_batting_aggression(P!(), obj, g);
+                        act = Some((ok, format!("打擊積極性 → {}", FIELDER_GRADE_OPTS[g as usize].1)));
+                    }
+                    ui.end_row();
+
+                    ui.label("選球眼")
+                        .on_hover_text(
+                            "栄冠模式實測：G~A（沒有 S）。\n\
+                             顯示等級在 +0xA53 bit3~5，同步值在 +0x10AA low3；\n\
+                             修改時會同步寫兩處，其他 bits 原樣保留。"
+                        );
+                    if let Some(g) = grade_btn(ui, cur.plate_discipline, &FIELDER_GRADE_OPTS, 52.0) {
+                        cur.plate_discipline = g;
+                        let ok = write_plate_discipline(P!(), obj, g);
+                        act = Some((ok, format!("選球眼 → {}", FIELDER_GRADE_OPTS[g as usize].1)));
+                    }
+                    ui.end_row();
+
+                    ui.label("人氣(投手/野手)")
+                        .on_hover_text(
+                            "栄冠模式實測：+0xA30 low3=1 時沒有人氣，=2 時有人氣。\n\
+                             只修改 low3，主要守備位置所在的 bit3~6 會原樣保留。"
+                        );
+                    let mut popularity = cur.popularity;
+                    if ui.checkbox(&mut popularity, "").changed() {
+                        cur.popularity = popularity;
+                        let ok = write_popularity(P!(), obj, popularity);
+                        act = Some((ok, format!("人氣(投手/野手) → {}", if popularity { "有" } else { "無" })));
+                    }
+                    ui.end_row();
+                });
+            }
 
             ui.add_space(6.0);
             ui.separator();
