@@ -521,11 +521,11 @@ pub const OFF_PERSONALITY: usize = 0xE81;
 pub const OFF_MOOD: usize = 0xE82;
 /// 栄冠球員體力（u16 little-endian，0..=0x01F4 / 0..=500）
 pub const OFF_ENERGY: usize = 0xE86;
-/// 栄冠球員學力實際值；畫面 Rank 依區間 E/D/C/B/A 顯示
-/// ⚠ **不要寫這裡，也不要當成學力。** 2026-08-29 實測：
-/// 寫 0、6、30、100、117、200、255 全部試過，畫面一律停在 E ——
-/// 這個 offset 對顯示沒有任何作用。真正的來源還沒找到。
-/// （實際值域 26~117 且隨年級遞增，看起來確實是某種累積點數，但不是畫面在讀的那個。）
+/// 栄冠球員學力實際值（u8）。
+/// 2026-08-30 重新以正確 Player Object 做差分與因果驗證，確認 +0xE88 會直接影響學力顯示。
+/// 已實測 Rank 區間：E=0x00..0x23、D=0x24..0x2D、C=0x2E..0x37、
+/// B=0x38..0x41、A=0x42..0x4B。
+/// ⚠ 先前判定「+0xE88 無效」是因為測到錯誤的球員 / Player Object；目前恢復為可寫欄位。
 pub const OFF_ACADEMIC: usize = 0xE88;
 /// 栄冠球員招募評價（u16 little-endian，0..=0x01FF / 0..=511）
 pub const OFF_RECRUIT_EVAL: usize = 0xE8C;

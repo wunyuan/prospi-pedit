@@ -2019,10 +2019,56 @@ impl App {
                     });
                     ui.end_row();
 
-                    // ⚠ 學力（+0xE88）的編輯功能已移除 —— 2026-08-29 實測寫 0 與 255
-                    //   畫面都停在 E，寫什麼都沒反應。PR #1 原本的區間表最高只到 0x4B(75)，
-                    //   但實際值域是 26~117，模型本身也不完整。
-                    //   真正的來源還沒找到，找到之前不提供編輯，免得使用者以為改好了。
+                    // 學力：+0xE88 / u8。2026-08-30 以正確 Player Object 重新驗證有效。
+                    // 已確認區間：E=00..23, D=24..2D, C=2E..37, B=38..41, A=42..4B。
+                    // 下拉選擇 Rank 時寫入該 Rank 的已知最高值，保留明確且可重現的結果。
+                    const ACADEMIC_OPTS: [(u8, &str); 5] = [
+                        (0x23, "E"),
+                        (0x2D, "D"),
+                        (0x37, "C"),
+                        (0x41, "B"),
+                        (0x4B, "A"),
+                    ];
+                    let old_academic = cur.academic;
+                    let academic_rank = match cur.academic {
+                        0x00..=0x23 => Some("E"),
+                        0x24..=0x2D => Some("D"),
+                        0x2E..=0x37 => Some("C"),
+                        0x38..=0x41 => Some("B"),
+                        0x42..=0x4B => Some("A"),
+                        _ => None,
+                    };
+                    ui.label("學力").on_hover_text(format!(
+                        "Player Object +0xE88 / u8\n已確認區間：E=00～23, D=24～2D, C=2E～37, B=38～41, A=42～4B\n目前 raw：0x{:02X}",
+                        cur.academic
+                    ));
+                    let shown = academic_rank
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("未知 (0x{:02X})", cur.academic));
+                    egui::ComboBox::from_id_source(("academic", obj))
+                        .selected_text(shown)
+                        .width(110.0)
+                        .show_ui(ui, |ui| {
+                            for &(raw, rank) in &ACADEMIC_OPTS {
+                                if ui.selectable_label(academic_rank == Some(rank), rank).clicked() {
+                                    cur.academic = raw;
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    if cur.academic != old_academic {
+                        let rank = match cur.academic {
+                            0x23 => "E",
+                            0x2D => "D",
+                            0x37 => "C",
+                            0x41 => "B",
+                            0x4B => "A",
+                            _ => "?",
+                        };
+                        let ok = P!().write(obj + OFF_ACADEMIC, &[cur.academic]);
+                        act = Some((ok, format!("學力 → {rank} (0x{:02X})", cur.academic)));
+                    }
+                    ui.end_row();
 
                     // 招募評價：u16，0..=0x01FF；星數只是遊戲 UI 的區間顯示。
                     let stars = match cur.recruit_eval.min(0x01FF) {
