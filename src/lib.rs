@@ -18,6 +18,9 @@ const TH32CS_SNAPPROCESS: u32 = 0x2;
 const TH32CS_SNAPMODULE: u32 = 0x8;
 const TH32CS_SNAPMODULE32: u32 = 0x10;
 const MEM_COMMIT: u32 = 0x1000;
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_RELEASE: u32 = 0x8000;
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 const PROCESS_QUERY_INFORMATION: u32 = 0x400;
 const PROCESS_VM_READ: u32 = 0x10;
 const PROCESS_VM_WRITE: u32 = 0x20;
@@ -75,6 +78,8 @@ extern "system" {
     fn CloseHandle(h: HANDLE) -> BOOL;
     fn VirtualQueryEx(h: HANDLE, a: *const c_void, b: *mut MEMORY_BASIC_INFORMATION,
                       l: usize) -> usize;
+    fn VirtualAllocEx(h: HANDLE, a: *mut c_void, s: usize, typ: u32, protect: u32) -> *mut c_void;
+    fn VirtualFreeEx(h: HANDLE, a: *mut c_void, s: usize, typ: u32) -> BOOL;
     fn ReadProcessMemory(h: HANDLE, a: *const c_void, b: *mut c_void, s: usize,
                          r: *mut usize) -> BOOL;
     fn WriteProcessMemory(h: HANDLE, a: *mut c_void, b: *const c_void, s: usize,
@@ -1085,6 +1090,16 @@ pub const KOSHIEN_STATIC: usize = KOSHIEN_STATIC_CANDS[0];
 pub const KOSHIEN_COUNT: usize = 0x185448;
 pub const KOSHIEN_ARRAY: usize = 0x185450;
 
+// ── 新生招募候選人表
+// Region[n] = modeobj + 0x185F78 + n*0x60
+// +0x08..+0x50 共 10 個 Candidate pointer；Candidate +0x18 = Player Object。
+pub const RECRUIT_REGION_BASE: usize = 0x185F78;
+pub const RECRUIT_REGION_STRIDE: usize = 0x60;
+pub const RECRUIT_CANDIDATE_N: usize = 10;
+pub const RECRUIT_PLAYER_FROM_CANDIDATE: usize = 0x18;
+/// 目前 UI 先以 47 個都道府縣 index（0..46）提供選擇。
+pub const RECRUIT_REGION_N: usize = 49;
+
 /// 栄冠 singleton getter 的指令樣式：`mov rax,[rip+disp32]` ＋ `mov rax,[rax+0x70]`。
 ///
 /// **為什麼不寫死靜態位址**：程式碼位址與模組內資料位址都會隨版本偏移，而且
@@ -1335,6 +1350,201 @@ fn koshien_roster_wrapper(p: &Proc) -> usize {
         }
     }
     0
+}
+
+/// 讀取指定地區的新生招募候選人。
+/// 回傳 `(candidate_index, Candidate base, Player Object base)`。
+///
+/// Candidate 結構已實機確認：`Player Object = Candidate + 0x18`，
+/// 因此姓名、主守備、野手/投手能力、特殊能力都直接沿用既有 `Player` parser。
+pub fn recruit_candidates(p: &Proc, region: usize) -> Vec<(usize, usize, usize)> {
+    if region >= RECRUIT_REGION_N || p.base == 0 {
+        return Vec::new();
+    }
+
+    let read_from_modeobj = |m: usize| -> Vec<(usize, usize, usize)> {
+        if m < 0x10000 {
+            return Vec::new();
+        }
+        let region_base = m + RECRUIT_REGION_BASE + region * RECRUIT_REGION_STRIDE;
+        let mut out = Vec::new();
+        for i in 0..RECRUIT_CANDIDATE_N {
+            let c = p.u64_at(region_base + (i + 1) * 8) as usize;
+            if c < 0x10000 {
+                continue;
+            }
+            let obj = c + RECRUIT_PLAYER_FROM_CANDIDATE;
+            let name = read_name(p, obj);
+            // 尚未生成的地區會有 Candidate slot，但姓名是遊戲預設的「未初期化」。
+            // 這種不能算真正可招募候選人。
+            if sane_name(&name) && name.trim() != "未初期化" {
+                out.push((i, c, obj));
+            }
+        }
+        out
+    };
+
+    // 招募畫面下優先直接走 singleton；不要求 roster state 一定已切好。
+    // static candidates 會包含 AOB 解析結果，因此仍可跨小版本搬移。
+    for st in koshien_static_candidates(p) {
+        let l1 = p.u64_at(st) as usize;
+        if l1 < 0x10000 {
+            continue;
+        }
+        let m = p.u64_at(l1 + 0x70) as usize;
+        let v = read_from_modeobj(m);
+        if !v.is_empty() {
+            return v;
+        }
+    }
+
+    // 最後再用既有 modeobj fallback。
+    read_from_modeobj(koshien_modeobj(p))
+}
+
+
+/// 只列出目前真正有候選球員名單的地區。
+/// 判定標準不是 pointer 非 0，而是至少一位 Candidate 能解析出合法姓名；
+/// 因此遊戲尚未生成、姓名顯示「未初期化」的地區不會出現在 UI。
+pub fn recruit_available_regions(p: &Proc) -> Vec<usize> {
+    (0..RECRUIT_REGION_N)
+        .filter(|&r| !recruit_candidates(p, r).is_empty())
+        .collect()
+}
+
+// ── 新生候選人：天才 flag
+// 已實機確認：FUN_1465B4FD0 控制 Player Object +0xE3C bit1。
+// 新生生成時原生判定為 FUN_1465AB250(99) < 1，因此預設約 1%。
+pub const OFF_TALENT_FLAGS: usize = 0xE3C;
+pub const TALENT_FLAG_MASK: u32 = 0x0000_0002;
+
+pub fn player_is_talent(p: &Proc, obj: usize) -> bool {
+    p.u32_at(obj + OFF_TALENT_FLAGS) & TALENT_FLAG_MASK != 0
+}
+
+pub fn write_player_talent(p: &Proc, obj: usize, talent: bool) -> bool {
+    let old = p.u32_at(obj + OFF_TALENT_FLAGS);
+    let new = if talent { old | TALENT_FLAG_MASK } else { old & !TALENT_FLAG_MASK };
+    p.write(obj + OFF_TALENT_FLAGS, &new.to_le_bytes())
+}
+
+// ── 新生天才出現機率 runtime patch
+// Ghidra 0x145E2BF37 / exe+0x5E2BF37：83 F8 01 = cmp eax,1。
+// EAX 是 0..99 的亂數，後面 `setl dl`，因此把 imm8 改成 0..100
+// 就能直接得到 0%..100% 的天才出現機率。
+pub const TALENT_RATE_PATCH_RVA: usize = 0x5E2BF37;
+pub const TALENT_RATE_DEFAULT: u8 = 1;
+
+pub fn talent_rate(p: &Proc) -> Option<u8> {
+    let site = p.base + TALENT_RATE_PATCH_RVA;
+    let cur = p.read(site, 3)?;
+    if cur.len() == 3 && cur[0] == 0x83 && cur[1] == 0xF8 && cur[2] <= 100 {
+        Some(cur[2])
+    } else {
+        None
+    }
+}
+
+pub fn set_talent_rate(p: &Proc, rate: u8) -> Result<(), String> {
+    if rate > 100 {
+        return Err("天才出現機率必須介於 0～100".into());
+    }
+    let site = p.base + TALENT_RATE_PATCH_RVA;
+    let cur = p.read(site, 3).ok_or("讀不到天才機率 patch 位址")?;
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+        return Err(format!("天才機率 patch 位址驗證失敗：exe+0x{:X} 不是預期的 cmp eax,imm8", TALENT_RATE_PATCH_RVA));
+    }
+    if cur[2] > 100 {
+        return Err(format!("天才機率目前值異常：{}", cur[2]));
+    }
+    if !p.write_code(site + 2, &[rate]) {
+        return Err("無法寫入天才出現機率".into());
+    }
+    Ok(())
+}
+
+// ── 新生招募成功率 100% runtime patch
+// 已實機確認：exe+0x65C6542 原始指令 `BF 63 00 00 00` (mov edi,99)。
+// 舊 CE 腳本在此跳 code cave：先 `mov esi,100`，再補回原指令。
+pub const RECRUIT_RATE_PATCH_RVA: usize = 0x65C6542;
+const RECRUIT_RATE_ORIG: [u8; 5] = [0xBF, 0x63, 0x00, 0x00, 0x00];
+static RECRUIT_RATE_CAVE: std::sync::Mutex<Option<(u32, usize)>> = std::sync::Mutex::new(None);
+
+pub fn recruit_rate_100_enabled(p: &Proc) -> bool {
+    let g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+    matches!(*g, Some((pid, _)) if pid == p.pid)
+}
+
+pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
+    let site = p.base + RECRUIT_RATE_PATCH_RVA;
+    let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+
+    if !enable {
+        if let Some((pid, cave)) = *g {
+            if pid == p.pid {
+                if !p.write_code(site, &RECRUIT_RATE_ORIG) {
+                    return Err("無法還原招募機率原始指令".into());
+                }
+                unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            }
+            *g = None;
+        }
+        return Ok(());
+    }
+
+    if matches!(*g, Some((pid, _)) if pid == p.pid) {
+        return Ok(());
+    }
+    // pid 已換：舊 process 的 cave 不再可用，直接丟掉記錄。
+    *g = None;
+
+    let cur = p.read(site, 5).ok_or("讀不到招募機率 patch 位址")?;
+    if cur.as_slice() != RECRUIT_RATE_ORIG {
+        return Err(format!("招募機率 patch 位址驗證失敗：exe+0x{:X} 不是預期指令", RECRUIT_RATE_PATCH_RVA));
+    }
+
+    // rel32 jmp 必須在 ±2GB。優先要求 Windows 在主模組附近配置一頁。
+    let mut cave = 0usize;
+    for delta in (0x0100_0000usize..=0x7000_0000).step_by(0x0100_0000) {
+        for addr in [p.base.wrapping_add(delta), p.base.wrapping_sub(delta)] {
+            let q = unsafe {
+                VirtualAllocEx(p.h, addr as *mut c_void, 0x1000,
+                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
+            } as usize;
+            if q != 0 {
+                let d = q as i128 - (site + 5) as i128;
+                if d >= i32::MIN as i128 && d <= i32::MAX as i128 {
+                    cave = q;
+                    break;
+                }
+                unsafe { VirtualFreeEx(p.h, q as *mut c_void, 0, MEM_RELEASE); }
+            }
+        }
+        if cave != 0 { break; }
+    }
+    if cave == 0 { return Err("無法在招募機率程式碼附近配置 code cave".into()); }
+
+    // cave: mov esi,100 ; mov edi,99 ; jmp site+5
+    let mut code = vec![0xBE,0x64,0,0,0, 0xBF,0x63,0,0,0, 0xE9,0,0,0,0];
+    let back = (site + 5) as i128 - (cave + code.len()) as i128;
+    if back < i32::MIN as i128 || back > i32::MAX as i128 {
+        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+        return Err("code cave 回跳距離超出 rel32".into());
+    }
+    code[11..15].copy_from_slice(&(back as i32).to_le_bytes());
+    if !p.write(cave, &code) {
+        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+        return Err("無法寫入招募機率 code cave".into());
+    }
+    let rel = cave as i128 - (site + 5) as i128;
+    let mut jmp = [0xE9,0,0,0,0];
+    jmp[1..5].copy_from_slice(&(rel as i32).to_le_bytes());
+    if !p.write_code(site, &jmp) {
+        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+        return Err("無法啟用招募機率 patch".into());
+    }
+    *g = Some((p.pid, cave));
+    Ok(())
 }
 
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。

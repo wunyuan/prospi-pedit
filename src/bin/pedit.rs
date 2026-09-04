@@ -214,6 +214,14 @@ enum Mode {
 enum KoshienRosterView {
     Sorted,
     Raw,
+    Recruit,
+}
+
+#[derive(Clone)]
+struct RecruitEntry {
+    index: usize,
+    candidate_addr: usize,
+    player: Player,
 }
 
 /// 能力研究用的選手物件記憶體快照。
@@ -238,6 +246,22 @@ struct App {
     err: String,
     mode: Mode,
     koshien_roster_view: KoshienRosterView,
+    /// 新生招募：目前選擇的地區 index。
+    recruit_region: usize,
+    /// 新生招募：目前真正有候選名單的地區。
+    recruit_regions: Vec<usize>,
+    /// 新生天才出現機率（0..=100）。原生預設 1%。
+    talent_rate: u8,
+    /// 招募成功率 100% patch 的 UI 狀態。
+    recruit_rate_100: bool,
+    /// 上一次已讀取的 Region；即使結果是空的也不會每幀重掃。
+    recruit_loaded_region: Option<usize>,
+    /// 新生招募：目前地區的候選人（保留原始 candidate index 0..9）。
+    recruit_list: Vec<RecruitEntry>,
+    recruit_sel: Option<usize>,
+    recruit_cur: Option<Player>,
+    /// 新生招募分頁開啟時，每 1 秒重新檢查可招募地區。
+    last_recruit_refresh: std::time::Instant,
     /// 榮冠 roster 尚未出現時，每 1 秒重試一次。
     last_koshien_retry: std::time::Instant,
     /// roster 已取得後，每 5 秒做一次輕量有效性檢查。
@@ -287,6 +311,22 @@ struct App {
     cheats: Arc<Cheats>,
 }
 
+const RECRUIT_REGION_NAMES: [&str; 49] = [
+    "北北海道", "南北海道", "青森", "岩手", "秋田", "山形", "宮城", "福島",
+    "茨城", "栃木", "群馬", "埼玉", "千葉", "神奈川", "山梨", "東東京", "西東京",
+    "新潟", "長野", "富山", "石川", "福井", "静岡", "愛知", "岐阜", "三重", "滋賀",
+    "京都", "大阪", "兵庫", "奈良", "和歌山", "岡山", "廣島", "鳥取", "島根", "山口",
+    "香川", "徳島", "愛媛", "高知", "福岡", "佐賀", "長崎", "熊本", "大分", "宮崎",
+    "鹿児島", "沖縄",
+];
+
+fn recruit_region_label(index: usize) -> String {
+    RECRUIT_REGION_NAMES
+        .get(index)
+        .map(|name| format!("{index}. {name}"))
+        .unwrap_or_else(|| format!("{index}"))
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
@@ -295,11 +335,21 @@ impl App {
             Ok(p) => (Some(p), String::new()),
             Err(e) => (None, e),
         };
+        let initial_talent_rate = proc.as_ref().and_then(talent_rate).unwrap_or(TALENT_RATE_DEFAULT);
         let mut app = App {
             proc,
             err,
             mode: Mode::Koshien,
             koshien_roster_view: KoshienRosterView::Sorted,
+            recruit_region: 0,
+            recruit_regions: Vec::new(),
+            talent_rate: initial_talent_rate,
+            recruit_rate_100: false,
+            recruit_loaded_region: None,
+            recruit_list: Vec::new(),
+            recruit_sel: None,
+            recruit_cur: None,
+            last_recruit_refresh: std::time::Instant::now(),
             last_koshien_retry: std::time::Instant::now(),
             last_koshien_validate: std::time::Instant::now(),
             filter: String::new(),
@@ -355,12 +405,17 @@ impl App {
         // 重新附加本來就不在每幀路徑上，多掃一次很便宜。
         koshien_cache_clear();
         roster_cache_clear();
+        self.recruit_loaded_region = None;
+        self.recruit_list.clear();
+        self.recruit_sel = None;
+        self.recruit_cur = None;
         match Proc::attach() {
             Ok(p) => {
                 self.status = match old {
                     Some(o) => format!("遊戲已重開（pid {o} → {}），已自動重新附加", p.pid),
                     None => format!("已附加 pid {}", p.pid),
                 };
+                self.talent_rate = talent_rate(&p).unwrap_or(TALENT_RATE_DEFAULT);
                 self.proc = Some(p);
                 self.err.clear();
                 true
@@ -441,6 +496,70 @@ impl App {
         }
 
         ctx.request_repaint_after(std::time::Duration::from_secs(5));
+    }
+
+    /// 新生招募分頁的輕量自動刷新：每 1 秒只重查「哪些 Region 已有候選人」。
+    /// 不每秒重建目前候選人列表，避免選中狀態一直被清掉；新地區出現後會自動加入下拉選單。
+    fn auto_refresh_recruit_regions(&mut self, ctx: &egui::Context) {
+        if self.mode != Mode::Koshien || self.koshien_roster_view != KoshienRosterView::Recruit {
+            return;
+        }
+
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_recruit_refresh) < std::time::Duration::from_secs(1) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+        self.last_recruit_refresh = now;
+
+        let regions = match self.proc.as_ref() {
+            Some(p) => recruit_available_regions(p),
+            None => Vec::new(),
+        };
+
+        if regions != self.recruit_regions {
+            self.recruit_regions = regions;
+            let old_region = self.recruit_region;
+            if !self.recruit_regions.contains(&self.recruit_region) {
+                if let Some(&r) = self.recruit_regions.first() {
+                    self.recruit_region = r;
+                }
+            }
+            if self.recruit_region != old_region
+                || self.recruit_loaded_region != Some(self.recruit_region)
+            {
+                self.reload_recruits();
+            }
+        }
+
+        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+    }
+
+    fn reload_recruits(&mut self) {
+        if let Some(p) = self.proc.as_ref() {
+            self.recruit_regions = recruit_available_regions(p);
+            if !self.recruit_regions.contains(&self.recruit_region) {
+                if let Some(&r) = self.recruit_regions.first() { self.recruit_region = r; }
+            }
+        }
+        self.recruit_loaded_region = Some(self.recruit_region);
+        self.recruit_list.clear();
+        self.recruit_sel = None;
+        self.recruit_cur = None;
+        let p = match &self.proc {
+            Some(p) => p,
+            None => return,
+        };
+        for (index, candidate_addr, obj) in recruit_candidates(p, self.recruit_region) {
+            if let Some(player) = Player::load(p, obj) {
+                self.recruit_list.push(RecruitEntry { index, candidate_addr, player });
+            }
+        }
+        self.status = if self.recruit_list.is_empty() {
+            format!("新生招募：Region {} 目前讀不到候選球員", self.recruit_region)
+        } else {
+            format!("新生招募：Region {} 讀到 {} 位候選球員", self.recruit_region, self.recruit_list.len())
+        };
     }
 
     fn reload_list(&mut self) {
@@ -1044,6 +1163,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _f: &mut eframe::Frame) {
         self.poll_scan(ctx);
         self.auto_refresh_koshien(ctx);
+        self.auto_refresh_recruit_regions(ctx);
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -1274,9 +1394,123 @@ impl eframe::App for App {
                         "原始名單",
                     )
                     .on_hover_text("完全照遊戲 roster array 的 index 0..N-1 顯示，不依守備位置重新排序");
+                    ui.selectable_value(
+                        &mut self.koshien_roster_view,
+                        KoshienRosterView::Recruit,
+                        "新生招募",
+                    )
+                    .on_hover_text("依 Region index 讀取該地區 10 位候選球員");
                 });
                 ui.separator();
             }
+
+            let recruit_view = self.mode == Mode::Koshien
+                && self.koshien_roster_view == KoshienRosterView::Recruit;
+
+            if recruit_view {
+                if self.recruit_regions.is_empty() {
+                    self.reload_recruits();
+                }
+                let old_region = self.recruit_region;
+
+                // 天才出現機率：直接修改原生 `cmp eax,1` 的門檻，0..100 對應 0%..100%。
+                ui.label("天才出現機率");
+                ui.horizontal(|ui| {
+                    let mut v = self.talent_rate.min(100);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 0..=100).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(0..=100).speed(1.0))
+                        .changed();
+                    ui.label("%");
+                    if slider_changed || input_changed {
+                        v = v.min(100);
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_talent_rate(p, v) {
+                                Ok(()) => {
+                                    self.talent_rate = v;
+                                    self.status = format!("天才出現機率 → {v}%");
+                                }
+                                Err(e) => self.status = format!("天才機率修改失敗：{e}"),
+                            }
+                        }
+                    }
+                });
+
+                // 招募機率獨立一列，放在地區選擇上方。
+                let mut want = self.recruit_rate_100;
+                if ui.checkbox(&mut want, "招募機率 100%").changed() {
+                    if let Some(p) = self.proc.as_ref() {
+                        match set_recruit_rate_100(p, want) {
+                            Ok(()) => {
+                                self.recruit_rate_100 = want;
+                                self.status = if want { "已啟用招募機率 100%".into() } else { "已還原原始招募機率".into() };
+                            }
+                            Err(e) => self.status = format!("招募機率修改失敗：{e}"),
+                        }
+                    }
+                }
+                ui.separator();
+
+                ui.horizontal(|ui| {
+                    ui.label("可招募的地區");
+                    let shown = if self.recruit_regions.contains(&self.recruit_region) {
+                        recruit_region_label(self.recruit_region)
+                    } else {
+                        "無".to_string()
+                    };
+                    egui::ComboBox::from_id_source("recruit_region")
+                        .selected_text(shown)
+                        .width(150.0)
+                        .show_ui(ui, |ui| {
+                            let regions = self.recruit_regions.clone();
+                            for r in regions {
+                                ui.selectable_value(&mut self.recruit_region, r, recruit_region_label(r));
+                            }
+                        });
+                });
+                if self.recruit_region != old_region
+                    || self.recruit_loaded_region != Some(self.recruit_region)
+                {
+                    self.reload_recruits();
+                }
+                ui.separator();
+
+                let mut pick: Option<usize> = None;
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    for (row, e) in self.recruit_list.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.add_sized(
+                                [34.0, 18.0],
+                                egui::Label::new(egui::RichText::new(format!("#{:02}", e.index)).monospace().weak()),
+                            );
+                            ui.add_sized(
+                                [30.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(pos_name(e.player.pos)).strong().color(pos_color(e.player.pos)),
+                                ),
+                            );
+                            let w = ui.available_width().max(40.0);
+                            if ui.add_sized(
+                                [w, 18.0],
+                                egui::SelectableLabel::new(self.recruit_sel == Some(row), &e.player.name),
+                            )
+                            .on_hover_text(format!(
+                                "Region {} / Candidate #{}\nCandidate: 0x{:X}\nPlayer Object: 0x{:X}",
+                                self.recruit_region, e.index, e.candidate_addr, e.player.addr
+                            ))
+                            .clicked() {
+                                pick = Some(row);
+                            }
+                        });
+                    }
+                });
+                if let Some(row) = pick {
+                    self.recruit_sel = Some(row);
+                    self.recruit_cur = self.recruit_list.get(row).map(|e| e.player.clone());
+                }
+            } else {
 
             ui.horizontal(|ui| {
                 ui.label("搜尋");
@@ -1443,19 +1677,215 @@ impl eframe::App for App {
                     self.reload_current();
                 }
             });
+            } // !recruit_view
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
-            if self.cur.is_none() {
-                ui.centered_and_justified(|ui| ui.label("← 從左邊選一位選手"));
-                return;
+            let recruit_view = self.mode == Mode::Koshien
+                && self.koshien_roster_view == KoshienRosterView::Recruit;
+            if recruit_view {
+                if self.recruit_cur.is_none() {
+                    ui.centered_and_justified(|ui| ui.label("← 從左邊選一位候選球員"));
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| self.recruit_editor(ui));
+            } else {
+                if self.cur.is_none() {
+                    ui.centered_and_justified(|ui| ui.label("← 從左邊選一位選手"));
+                    return;
+                }
+                egui::ScrollArea::vertical().show(ui, |ui| self.editor(ui));
             }
-            egui::ScrollArea::vertical().show(ui, |ui| self.editor(ui));
         });
     }
 }
 
 impl App {
+    /// 新生招募候選人只顯示/編輯已確認與一般 Player Object 共用的區域：
+    /// 主守位、投手/野手守備適性、八項能力、球速/耐力、捕手配球、特殊能力。
+    /// 不顯示性格/學力/年級等尚未確認能否直接沿用的欄位。
+    fn recruit_editor(&mut self, ui: &mut egui::Ui) {
+        let mut cur = match self.recruit_cur.clone() { Some(v) => v, None => return };
+        let obj = cur.addr;
+        let mut act: Option<(bool, String)> = None;
+        macro_rules! P { () => { match &self.proc { Some(p) => p, None => return } }; }
+
+        let (cand_index, cand_addr) = self.recruit_sel
+            .and_then(|i| self.recruit_list.get(i).map(|e| (e.index, e.candidate_addr)))
+            .unwrap_or((0, obj.saturating_sub(RECRUIT_PLAYER_FROM_CANDIDATE)));
+        ui.horizontal(|ui| {
+            ui.heading(&cur.name);
+            ui.colored_label(pos_color(cur.pos), egui::RichText::new(pos_name(cur.pos)).strong());
+            ui.monospace(format!(
+                "Region {} / Candidate #{}  |  C=0x{:X}  P=0x{:X}",
+                self.recruit_region, cand_index, cand_addr, obj
+            ));
+            if ui.button("重新讀取").clicked() {
+                if let Some(pl) = Player::load(P!(), obj) {
+                    cur = pl;
+                }
+            }
+        });
+        ui.separator();
+
+        // 只用 raw Player Object 欄位，不碰一般部員的成長經驗值同步區。
+        egui::CollapsingHeader::new("投手能力／守備適性").default_open(true).show(ui, |ui| {
+            egui::Grid::new("recruit_basic").num_columns(2).spacing([12.0, 6.0]).show(ui, |ui| {
+                ui.label("主要守備位置");
+                let old_pos = cur.pos;
+                egui::ComboBox::from_id_source(("recruit_main_pos", obj))
+                    .selected_text(pos_name(cur.pos)).width(90.0).show_ui(ui, |ui| {
+                        for (v, name) in POS_NAMES.iter().enumerate() {
+                            ui.selectable_value(&mut cur.pos, v as u8, *name);
+                        }
+                    });
+                if cur.pos != old_pos {
+                    let ok = write_pos(P!(), obj, cur.pos);
+                    act = Some((ok, format!("主要守備位置 → {}", pos_name(cur.pos))));
+                }
+                ui.end_row();
+
+                // 候選球員打擊仰角／打球型態：沿用已驗證的 Player Object 真值欄位。
+                ui.label("打擊仰角");
+                let old_style = cur.batting_style;
+                egui::ComboBox::from_id_source(("recruit_batting_style", obj))
+                    .selected_text(batting_style_name(cur.batting_style))
+                    .width(130.0)
+                    .show_ui(ui, |ui| {
+                        for (v, name) in BATTING_STYLE_NAMES.iter().enumerate() {
+                            ui.selectable_value(&mut cur.batting_style, v as u8, *name);
+                        }
+                    });
+                if cur.batting_style != old_style && cur.batting_style != BATTING_STYLE_UNKNOWN {
+                    let ok = write_batting_style(P!(), obj, cur.batting_style);
+                    act = Some((ok, format!("打擊仰角 → {}", batting_style_name(cur.batting_style))));
+                }
+                ui.end_row();
+
+                // 候選人天才：Player Object +0xE3C bit1（Candidate +0xE54 bit1），已實機確認。
+                ui.label("天才");
+                let mut talent = player_is_talent(P!(), obj);
+                if ui.checkbox(&mut talent, "").changed() {
+                    let ok = write_player_talent(P!(), obj, talent);
+                    act = Some((ok, if talent { "天才 → 是".into() } else { "天才 → 否".into() }));
+                }
+                ui.end_row();
+
+                ui.label("球速 km/h");
+                if ui.add(egui::Slider::new(&mut cur.speed, 80..=SPEED_UI_MAX)).changed() {
+                    let ok = write_pack(P!(), obj, cur.speed, cur.stamina, cur.pack_hi);
+                    act = Some((ok, "球速".into()));
+                }
+                ui.end_row();
+                ui.label("耐力");
+                if ui.add(egui::Slider::new(&mut cur.stamina, 0..=99)).changed() {
+                    let ok = write_pack(P!(), obj, cur.speed, cur.stamina, cur.pack_hi);
+                    act = Some((ok, "耐力".into()));
+                }
+                ui.end_row();
+                ui.label("投手適性");
+                if ui.add(egui::Slider::new(&mut cur.defense, 0..=99)).changed() {
+                    let ok = P!().write(obj + OFF_DEF, &[cur.defense]);
+                    act = Some((ok, "投手適性".into()));
+                }
+                ui.end_row();
+
+                for fi in 0..GROWTH_FIELD_N {
+                    ui.label(FIELD_NAMES[fi]);
+                    if ui.add(egui::Slider::new(&mut cur.field[fi], 0..=99)).changed() {
+                        let ok = P!().write(obj + 0x18 + fi, &[cur.field[fi]]);
+                        act = Some((ok, FIELD_NAMES[fi].into()));
+                    }
+                    ui.end_row();
+                }
+
+                ui.label("捕手配球");
+                if let Some(g) = grade_btn(ui, cur.catcher, &GS_OPTS, 52.0) {
+                    cur.catcher = g;
+                    let ok = write_catcher(P!(), obj, g);
+                    act = Some((ok, "捕手配球".into()));
+                }
+                ui.end_row();
+            });
+        });
+
+        egui::CollapsingHeader::new("野手能力").default_open(true).show(ui, |ui| {
+            egui::Grid::new("recruit_stats").num_columns(3).spacing([12.0, 6.0]).show(ui, |ui| {
+                for i in 0..8 {
+                    ui.label(STAT_NAMES[i]);
+                    let mut v = cur.stats[i];
+                    if ui.add(egui::Slider::new(&mut v, 1..=STAT_UI_MAX)).changed() {
+                        cur.stats[i] = v;
+                        let ok = P!().write(obj + OFF_STATS + i, &[v]);
+                        act = Some((ok, STAT_NAMES[i].into()));
+                    }
+                    ui.label(grade_of(cur.stats[i]));
+                    ui.end_row();
+                }
+            });
+        });
+
+        egui::CollapsingHeader::new("特殊能力").default_open(true).show(ui, |ui| {
+            ui.label(egui::RichText::new("等級能力").strong());
+            egui::Grid::new("recruit_abil_graded").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
+                for &n in ABIL_GRADED {
+                    let optional = ABIL_GRADED_OPTIONAL.contains(&n);
+                    let nib = abil_nib(&cur.abil, n);
+                    let (lv, extra) = (nib & 7, nib & 8 != 0);
+                    ui.label(abil_name(n));
+                    let mut opts: Vec<(u8, &str)> = vec![(5,"G"),(6,"F"),(7,"E"),(0,"D"),(1,"C"),(2,"B"),(3,"A")];
+                    if optional { opts.retain(|&(v,_)| v != 0); opts.insert(0,(0,"（無）")); }
+                    if let Some(newlv) = grade_btn(ui, lv, &opts, 78.0) {
+                        let nv = (nib & 8) | newlv;
+                        let ok = write_abil_nibble(P!(), obj, n, nv);
+                        set_nib(&mut cur.abil, n, nv);
+                        act = Some((ok, format!("{} 等級", abil_name(n))));
+                    }
+                    let bit3 = ABIL_GRADED_BIT3.iter().find(|e| e.0 == n).map(|e| e.1).unwrap_or("");
+                    let mut on = extra;
+                    if !bit3.is_empty() && ui.checkbox(&mut on, bit3).changed() {
+                        let nv = (nib & 7) | if on { 8 } else { 0 };
+                        let ok = write_abil_nibble(P!(), obj, n, nv);
+                        set_nib(&mut cur.abil, n, nv);
+                        act = Some((ok, bit3.into()));
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.separator();
+            ui.label(egui::RichText::new("變體能力").strong());
+            egui::Grid::new("recruit_abil_bits").num_columns(5).spacing([8.0,3.0]).show(ui, |ui| {
+                for n in 0..ABIL_NIBBLES {
+                    if abil_is_graded(n) { continue; }
+                    let nib = abil_nib(&cur.abil, n);
+                    ui.label(egui::RichText::new(format!("n{n:<2}")).weak().small());
+                    for b in 0..4u8 {
+                        let name = ABIL_BITS.iter().find(|e| e.0 == n && e.1 == b).map(|e| e.2).unwrap_or("—");
+                        let mut on = nib >> b & 1 == 1;
+                        if ui.add_enabled(name != "—", egui::Checkbox::new(&mut on, name)).changed() {
+                            let nv = if on { nib | 1 << b } else { nib & !(1 << b) };
+                            let ok = write_abil_nibble(P!(), obj, n, nv);
+                            set_nib(&mut cur.abil, n, nv);
+                            act = Some((ok, name.into()));
+                        }
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.label(egui::RichText::new(format!(
+                "現值 {}", cur.abil.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
+            )).weak().small().monospace());
+        });
+
+        if let Some((ok, what)) = act {
+            self.status = if ok { format!("新生招募：已寫入 {what}") } else { format!("新生招募：寫入失敗 {what}") };
+        }
+        self.recruit_cur = Some(cur.clone());
+        if let Some(i) = self.recruit_sel {
+            if let Some(e) = self.recruit_list.get_mut(i) { e.player = cur; }
+        }
+    }
+
     fn editor(&mut self, ui: &mut egui::Ui) {
         let mut cur = self.cur.clone().unwrap();
         let obj = cur.addr;
