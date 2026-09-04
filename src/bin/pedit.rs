@@ -1446,7 +1446,7 @@ impl eframe::App for App {
             // 即使目前沒有任何可招募地區／候選球員，也必須允許隨時操作。
             if recruit_view {
                 // 天才出現機率：直接修改原生 `cmp eax,1` 的門檻，0..100 對應 0%..100%。
-                ui.label("天才出現機率");
+                ui.label("天才出現機率（招募與新生，轉生除外）");
                 ui.horizontal(|ui| {
                     let mut v = self.talent_rate.min(100);
                     let slider_changed = ui
