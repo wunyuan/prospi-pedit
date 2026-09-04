@@ -1072,21 +1072,9 @@ pub fn clear_rec(p: &Proc, obj: usize, idx: usize) -> bool {
 // 2026-08-28 新版：同一個 static root 分成「部員名單」與「道具」兩條鏈
 // （wrapper 鏈由 PR #1 找到；終點跟 `modeobj + 0x185440` 是同一個位置）。
 
-/// 栄冠 singleton 的靜態位址，**新的在前**。
-///
-/// 2026-08-29 的遊戲更新（exe 632MB → 662MB）只搬動了這個位址，
-/// `+0x70` 以下的整條鏈與 modeobj 內部 offset **全部沒變** ——
-/// 一度誤判成「名單改成 vector、結構全變了」，其實是找錯了物件。
-///
-/// | 版本 | 靜態位址 |
-/// |---|---|
-/// | 2026-08-27 更新後 | `exe+139C5EA0` |
-/// | 更新前 | `exe+13626518` |
-///
-/// 逐一驗證（讀到合法的部員數＋姓名才算數），所以多列幾個不會有副作用。
-pub const KOSHIEN_STATIC_CANDS: [usize; 2] = [0x139C5EA0, 0x13626518];
-/// 相容用：等於候選清單的第一個。
-pub const KOSHIEN_STATIC: usize = KOSHIEN_STATIC_CANDS[0];
+/// 栄冠 singleton 的靜態位址。
+/// 原作者路徑：`[exe + KOSHIEN_STATIC] -> +0x70 = ModeObj`。
+pub const KOSHIEN_STATIC: usize = 0x139C5EA0;
 pub const KOSHIEN_COUNT: usize = 0x185448;
 pub const KOSHIEN_ARRAY: usize = 0x185450;
 
@@ -1100,114 +1088,17 @@ pub const RECRUIT_PLAYER_FROM_CANDIDATE: usize = 0x18;
 /// 目前 UI 先以 47 個都道府縣 index（0..46）提供選擇。
 pub const RECRUIT_REGION_N: usize = 49;
 
-/// 栄冠 singleton getter 的指令樣式：`mov rax,[rip+disp32]` ＋ `mov rax,[rax+0x70]`。
-///
-/// **為什麼不寫死靜態位址**：程式碼位址與模組內資料位址都會隨版本偏移，而且
-/// 偏移量彼此不一致（2026-08-29 實測三條 AOB 分別是 +0x5A390 / +0x5F65B / +0x62110）。
-/// 靠 getter 指令的 disp32 反算，等於讓遊戲自己告訴我們位址在哪，跨版本自動跟上。
-pub const KOSHIEN_GETTER_AOB: &str = "48 8B 05 ?? ?? ?? ?? 48 8B 40 70";
-
-/// 解析 `mov rax,[rip+disp32]`（7 bytes）指到的絕對位址。
-fn rip_target(p: &Proc, insn: usize) -> Option<usize> {
-    let b = p.read(insn, 7)?;
-    let disp = i32::from_le_bytes([b[3], b[4], b[5], b[6]]) as i64;
-    let t = insn as i64 + 7 + disp;
-    if t <= 0 { None } else { Some(t as usize) }
-}
-
-/// AOB 掃描結果的快取。key ＝ pid（遊戲重開換 pid 就重掃）。
-///
-/// ⚠ **這個快取是必要的，不是最佳化**：掃描要跑過 900MB 的程式碼段，
-/// 而 `koshien_modeobj()` 在 pedit 裡是每幀路徑上的呼叫
-/// （2026-08-01 已經踩過一次「AOB 進每幀路徑 → UI 卡死」）。
-/// 候選清單不需要進入栄冠模式就能建立，所以掃一次就能一直用；
-/// **驗證留到讀取時做**（純讀幾個 qword，很便宜）。
-static KOSHIEN_CAND: std::sync::Mutex<Option<(u32, Vec<usize>)>> =
-    std::sync::Mutex::new(None);
-
-/// 栄冠 singleton 的靜態位址**候選清單**（AOB 每個 pid 只掃一次）。
-///
-/// 舊的寫死位址排在最前面 —— 萬一哪天又能用，就省掉一次掃描。
-pub fn koshien_static_candidates(p: &Proc) -> Vec<usize> {
-    if p.base == 0 {
-        return Vec::new();
-    }
-    let mut g = KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((pid, v)) = g.as_ref() {
-        if *pid == p.pid {
-            return v.clone();
-        }
-    }
-    // 只收落在**主模組**裡的目標。`exec_ranges()` 連 ntdll/kernel32 一起掃，
-    // 那些模組的同樣式指令會解析出 0x7ffe... 之類的位址，全是雜訊。
-    // 遊戲 exe 實測 662MB，這裡放寬到 768MB。
-    const MODULE_SPAN: usize = 0x3000_0000;
-    let in_module = |t: usize| t > p.base && t < p.base + MODULE_SPAN;
-    let mut v: Vec<usize> = KOSHIEN_STATIC_CANDS.iter().map(|o| p.base + o).collect();
-    for insn in find_code_all(p, KOSHIEN_GETTER_AOB) {
-        if !in_module(insn) {
-            continue;
-        }
-        if let Some(t) = rip_target(p, insn) {
-            if in_module(t) && !v.contains(&t) {
-                v.push(t);
-            }
-        }
-    }
-    *g = Some((p.pid, v.clone()));
-    v
-}
-
-/// 清掉 AOB 快取（「重新附加」時呼叫）。
-pub fn koshien_cache_clear() {
-    *KOSHIEN_CAND.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-/// modeobj 的合理性檢查：部員數要在 1..=512，而且第一位部員讀得出合法姓名。
-///
-/// getter 樣式在程式碼段不只一個命中（實測 2 個），光靠「指標非 0」分不出來 ——
-/// 一定要往下讀到**姓名**才算數。
-fn koshien_modeobj_valid(p: &Proc, m: usize) -> bool {
-    if m < 0x10000 {
-        return false;
-    }
-    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
-    if n == 0 || n > 512 {
-        return false;
-    }
-    let first = p.u64_at(m + KOSHIEN_ARRAY) as usize;
-    if first < 0x10000 {
-        return false;
-    }
-    sane_name(&read_name(p, first))
-}
-
 /// 栄冠的 mode 物件（`[static] -> +0x70`），道具與練習效果都掛在它底下。
 /// 離開該模式時 singleton 會變回 0（回傳 0 屬正常）。
 pub fn koshien_modeobj(p: &Proc) -> usize {
     if p.base == 0 {
         return 0;
     }
-    for st in koshien_static_candidates(p) {
-        let l1 = p.u64_at(st) as usize;
-        if l1 < 0x10000 {
-            continue;
-        }
-        let m = p.u64_at(l1 + 0x70) as usize;
-        if koshien_modeobj_valid(p, m) {
-            return m;
-        }
+    let l1 = p.u64_at(p.base + KOSHIEN_STATIC) as usize;
+    if l1 == 0 {
+        return 0;
     }
-    // 指標鏈失效時，用 `koshien_roster()` 掃描留下的結果 —— 道具數量與
-    // 練習效果提升都掛在 modeobj 上，這樣它們也跟著一起救回來。
-    // ⚠ 這裡**只讀快取、不觸發掃描**（本函式在 pedit 是每幀路徑）。
-    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some((pid, Some(m))) = cached {
-        if pid == p.pid && koshien_modeobj_valid(p, m) {
-            return m;
-        }
-    }
-    0
+    p.u64_at(l1 + 0x70) as usize
 }
 
 // ─────────────────── 栄冠部員名單：vector 特徵掃描（2026-08-29 遊戲更新後改用）
@@ -1215,141 +1106,6 @@ pub fn koshien_modeobj(p: &Proc) -> usize {
 /// 一個位址看起來像不像遊戲堆積上的物件。
 fn plausible_heap(a: usize) -> bool {
     (0x1000_0000..0x2_0000_0000).contains(&a) && a % 8 == 0
-}
-
-/// 這個位址是不是一個合法的**選手物件**（姓名 ＋ 8 項能力 ＋ 球種簽章都要過）。
-fn looks_like_player(p: &Proc, obj: usize) -> bool {
-    if !plausible_heap(obj) {
-        return false;
-    }
-    let Some(raw) = p.read(obj, PLAYER_READ) else { return false };
-    if !ball_sig_ok(&raw[OFF_BALL..OFF_BALL + 36]) {
-        return false;
-    }
-    if !raw[OFF_STATS..OFF_STATS + 8].iter().all(|&v| (1..=127).contains(&v)) {
-        return false;
-    }
-    sane_name(&name_from(&raw))
-}
-
-/// 栄冠部員名單的上限。實測一隊 30 人，放寬到 64。
-const ROSTER_MAX: usize = 64;
-
-/// 掃描找出栄冠的 `modeobj`（指標鏈失效時的逃生口）。
-///
-/// **判準是零成本的**：部員名單陣列的正前方 8 bytes 就是
-/// `KOSHIEN_COUNT`（部員數 i32），而 `KOSHIEN_ARRAY = KOSHIEN_COUNT + 8`。
-/// 所以只要在同一個 buffer 裡看「這個 i32 是不是等於後面連續合法指標的個數」，
-/// 完全不必額外讀記憶體就能篩掉幾乎所有位置，通過的才去驗選手簽章。
-///
-/// 為什麼要找 modeobj 而不是只找名單：道具數量、練習效果提升天數
-/// 全都掛在 `modeobj + KOSHIEN_ITEMOBJ` 上，拿到 modeobj 等於整組功能一起救回來。
-///
-/// ⚠ 這支要掃全記憶體（實測 30 秒），**絕對不可以放進每幀路徑**。
-pub fn find_koshien_modeobj(p: &Proc) -> Option<usize> {
-    const CHUNK: usize = 64 << 20;
-    for (base, size) in p.writable_ranges() {
-        let mut off = 0usize;
-        while off < size {
-            let want = (size - off).min(CHUNK + ROSTER_MAX * 8 + 16);
-            if let Some(buf) = p.read(base + off, want) {
-                let rd = |i: usize| u64::from_le_bytes(buf[i..i + 8].try_into().unwrap()) as usize;
-                let mut q = 8usize;
-                while q + 8 <= buf.len() {
-                    let n = u32::from_le_bytes(buf[q - 8..q - 4].try_into().unwrap()) as usize;
-                    q += 8;
-                    if n == 0 || n > ROSTER_MAX || q - 8 + n * 8 > buf.len() {
-                        continue;
-                    }
-                    let start = q - 8;
-                    if !(0..n).all(|i| plausible_heap(rd(start + i * 8))) {
-                        continue;
-                    }
-                    // 只驗前兩格 —— 不是名單的話這裡幾乎一定掛掉
-                    if !(0..n.min(2)).all(|i| looks_like_player(p, rd(start + i * 8))) {
-                        continue;
-                    }
-                    if !(0..n).all(|i| looks_like_player(p, rd(start + i * 8))) {
-                        continue;
-                    }
-                    return Some((base + off + start).wrapping_sub(KOSHIEN_ARRAY));
-                }
-            }
-            off += CHUNK;
-        }
-    }
-    None
-}
-
-/// 掃描找到的 modeobj 快取，以及「這個 pid 已經掃過了」的記號。
-///
-/// 掃描要 30 秒，**每個 pid 只能掃一次** —— 否則指標鏈壞掉時，
-/// 每次重新整理都會重掃一遍，UI 等於整個卡死。
-static MODEOBJ_SCAN: std::sync::Mutex<Option<(u32, Option<usize>)>> =
-    std::sync::Mutex::new(None);
-
-/// 清掉掃描快取（「重新附加」時呼叫）。
-pub fn roster_cache_clear() {
-    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-}
-
-/// 指標鏈失效時的逃生口：掃描找 modeobj，結果（含失敗）依 pid 快取。
-pub fn koshien_modeobj_scanned(p: &Proc) -> usize {
-    if p.base == 0 {
-        return 0;
-    }
-    let cached = MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    if let Some((pid, r)) = cached {
-        if pid == p.pid {
-            // 物件會搬家，所以用之前先驗一次；失效就重掃
-            if let Some(m) = r {
-                if koshien_modeobj_valid(p, m) {
-                    return m;
-                }
-            } else {
-                return 0;
-            }
-        }
-    }
-    let r = find_koshien_modeobj(p);
-    *MODEOBJ_SCAN.lock().unwrap_or_else(|e| e.into_inner()) = Some((p.pid, r));
-    r.unwrap_or(0)
-}
-
-/// 栄冠部員名單的 wrapper：`[static] -> +0x60 -> +0x20 -> +0x78 -> +0x08`。
-///
-/// 這條鏈由 PR #1 找到。它的終點其實就是 `modeobj + 0x185440` ——
-/// wrapper `+0x08`／`+0x10` 正好等於 [`KOSHIEN_COUNT`]／[`KOSHIEN_ARRAY`]，
-/// 兩條路徑殊途同歸，留著兩條是因為**不知道下次版本會斷哪一條**。
-///
-/// 每個候選都驗到「部員數合理 ＋ 第一位讀得出合法姓名」才採用。
-fn koshien_roster_wrapper(p: &Proc) -> usize {
-    for root in koshien_static_candidates(p) {
-        let mut o = p.u64_at(root) as usize;
-        if o < 0x10000 {
-            continue;
-        }
-        let mut ok = true;
-        for off in [0x60usize, 0x20, 0x78, 0x08] {
-            o = p.u64_at(o + off) as usize;
-            if o < 0x10000 {
-                ok = false;
-                break;
-            }
-        }
-        if !ok {
-            continue;
-        }
-        let n = p.u64_at(o + 0x08) as usize;
-        if n == 0 || n > 128 {
-            continue;
-        }
-        let first = p.u64_at(o + 0x10) as usize;
-        if first >= 0x10000 && sane_name(&read_name(p, first)) {
-            return o;
-        }
-    }
-    0
 }
 
 /// 讀取指定地區的新生招募候選人。
@@ -1384,21 +1140,8 @@ pub fn recruit_candidates(p: &Proc, region: usize) -> Vec<(usize, usize, usize)>
         out
     };
 
-    // 招募畫面下優先直接走 singleton；不要求 roster state 一定已切好。
-    // static candidates 會包含 AOB 解析結果，因此仍可跨小版本搬移。
-    for st in koshien_static_candidates(p) {
-        let l1 = p.u64_at(st) as usize;
-        if l1 < 0x10000 {
-            continue;
-        }
-        let m = p.u64_at(l1 + 0x70) as usize;
-        let v = read_from_modeobj(m);
-        if !v.is_empty() {
-            return v;
-        }
-    }
-
-    // 最後再用既有 modeobj fallback。
+    // 新生招募與原作者榮冠 roster 共用同一個固定 ModeObj。
+    // 是否允許讀 Region/Candidate 由 pedit 的 koshien_roster gate 負責。
     read_from_modeobj(koshien_modeobj(p))
 }
 
@@ -1475,22 +1218,36 @@ pub fn recruit_rate_100_enabled(p: &Proc) -> bool {
     matches!(*g, Some((pid, _)) if pid == p.pid)
 }
 
-pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
+/// 關閉「招募機率100%」patch。
+///
+/// 只允許還原「本次修改器 instance 自己建立、且仍有 cave 記錄」的 patch。
+/// 不會在啟動時掃到任意 JMP 就強制寫回原始 bytes，避免誤傷遊戲或其他工具的修改。
+pub fn reset_recruit_rate_patch(p: &Proc) -> Result<bool, String> {
     let site = p.base + RECRUIT_RATE_PATCH_RVA;
     let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let cave = match *g {
+        Some((pid, cave)) if pid == p.pid => cave,
+        _ => return Ok(false),
+    };
+
+    if !p.write_code(site, &RECRUIT_RATE_ORIG) {
+        return Err("無法還原招募機率原始指令".into());
+    }
+
+    unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+    *g = None;
+    Ok(true)
+}
+
+pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
+    let site = p.base + RECRUIT_RATE_PATCH_RVA;
 
     if !enable {
-        if let Some((pid, cave)) = *g {
-            if pid == p.pid {
-                if !p.write_code(site, &RECRUIT_RATE_ORIG) {
-                    return Err("無法還原招募機率原始指令".into());
-                }
-                unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
-            }
-            *g = None;
-        }
+        reset_recruit_rate_patch(p)?;
         return Ok(());
     }
+
+    let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
 
     if matches!(*g, Some((pid, _)) if pid == p.pid) {
         return Ok(());
@@ -1549,54 +1306,21 @@ pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
 
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
 ///
-/// **三層**，一層比一層貴，前一層拿得到就不會走到下一層：
-/// 1. `modeobj + KOSHIEN_ARRAY`
-/// 2. wrapper 鏈（PR #1）
-/// 3. 全記憶體掃描（每個 pid 只掃一次，見 [`koshien_modeobj_scanned`]）
-///
-/// ⚠ **順序是實測決定的，不要調回去。** 2026-08-29 讀完存檔後實測：
-/// wrapper 鏈第 3 跳落到一個非 8 對齊的位址、第 4 跳讀出 `0xFF`，**整條斷掉**；
-/// 同一時刻 `modeobj + KOSHIEN_ARRAY` 正常回傳 30 人。
-/// 兩條路的終點本來是同一個位置（wrapper ＝ `modeobj + 0x185440`），
-/// 但中間那幾層顯然會隨畫面／載入狀態變動，所以走固定 offset 的那條穩定得多。
+/// 只走固定 `ModeObj + KOSHIEN_ARRAY` 路徑。
+/// ModeObj 無效時立即回傳空名單，不做 wrapper 或全記憶體 fallback 掃描。
 pub fn koshien_roster(p: &Proc) -> Vec<usize> {
+    // 快速模式判斷：只接受固定 ModeObj 路徑。
+    // ModeObj 無效時立即回傳空名單，絕不因為 reload/啟動/Region 刷新而觸發全記憶體掃描。
     let modeobj = koshien_modeobj(p);
-    if modeobj != 0 {
-        let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
-        if n > 0 && n <= 512 {
-            let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
-                .filter(|&o| o != 0)
-                .collect();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    let w = koshien_roster_wrapper(p);
-    if w != 0 {
-        let n = p.u64_at(w + 0x08) as usize;
-        if n > 0 && n <= 128 {
-            let v: Vec<usize> = (0..n)
-                .map(|i| p.u64_at(w + 0x10 + i * 8) as usize)
-                .filter(|&o| o != 0)
-                .collect();
-            if !v.is_empty() {
-                return v;
-            }
-        }
-    }
-    // 指標鏈全斷 —— 掃描找 modeobj（每個 pid 只掃一次）
-    let m = koshien_modeobj_scanned(p);
-    if m == 0 {
+    if modeobj == 0 {
         return Vec::new();
     }
-    let n = p.u32_at(m + KOSHIEN_COUNT) as usize;
+    let n = p.u32_at(modeobj + KOSHIEN_COUNT) as usize;
     if n == 0 || n > 512 {
         return Vec::new();
     }
     (0..n)
-        .map(|i| p.u64_at(m + KOSHIEN_ARRAY + i * 8) as usize)
+        .map(|i| p.u64_at(modeobj + KOSHIEN_ARRAY + i * 8) as usize)
         .filter(|&o| o != 0)
         .collect()
 }
@@ -1610,11 +1334,10 @@ pub fn koshien_roster(p: &Proc) -> Vec<usize> {
 ///
 /// 任一檢查失敗就整批拒絕，避免 roster chain 尚未切到正確 state 時誤寫其他物件。
 pub fn validated_koshien_roster(p: &Proc) -> Result<Vec<usize>, String> {
-    // ⚠ 原本綁死 wrapper 鏈，改成走 `koshien_roster()` —— 那邊有三層 fallback，
-    //   wrapper 斷掉時還有 modeobj offset 與掃描可用，全隊功能才不會整個消失。
+    // `koshien_roster()` 只走固定 ModeObj 快速路徑；不在榮冠時立即拒絕。
     let list = koshien_roster(p);
     if list.is_empty() {
-        return Err("榮冠球員名單尚未就緒（未在球員列表中，或指標鏈與掃描都找不到）".into());
+        return Err("榮冠球員名單尚未就緒（目前不在榮冠模式，或固定 ModeObj 尚未有效）".into());
     }
     if list.len() > 128 {
         return Err(format!("榮冠球員人數異常：{}", list.len()));

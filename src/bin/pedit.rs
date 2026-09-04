@@ -331,6 +331,8 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let libpath = origlib_path();
+        // 啟動時只附加遊戲，不主動檢查或改寫招募機率的程式碼。
+        // 招募機率 patch 的生命週期只由本次修改器 instance 的 checkbox 管理。
         let (proc, err) = match Proc::attach() {
             Ok(p) => (Some(p), String::new()),
             Err(e) => (None, e),
@@ -400,21 +402,27 @@ impl App {
         if self.proc_alive() {
             return true;
         }
+        // 如果這次修改器自己曾開啟招募機率 patch，先嘗試關閉。
+        // 若遊戲 process 已經真的消失，寫回會失敗也沒關係：process 結束後 patch 本身也不存在。
+        if self.recruit_rate_100 {
+            if let Some(p) = self.proc.as_ref() {
+                let _ = set_recruit_rate_100(p, false);
+            }
+            self.recruit_rate_100 = false;
+        }
         let old = self.proc.take().map(|p| p.pid);
-        // AOB 快取是以 pid 為 key，但遊戲重開後湊巧拿到同一個 pid 就會沿用舊結果。
-        // 重新附加本來就不在每幀路徑上，多掃一次很便宜。
-        koshien_cache_clear();
-        roster_cache_clear();
         self.recruit_loaded_region = None;
         self.recruit_list.clear();
         self.recruit_sel = None;
         self.recruit_cur = None;
         match Proc::attach() {
             Ok(p) => {
-                self.status = match old {
+                let attach_msg = match old {
                     Some(o) => format!("遊戲已重開（pid {o} → {}），已自動重新附加", p.pid),
                     None => format!("已附加 pid {}", p.pid),
                 };
+                self.status = attach_msg;
+                self.recruit_rate_100 = false;
                 self.talent_rate = talent_rate(&p).unwrap_or(TALENT_RATE_DEFAULT);
                 self.proc = Some(p);
                 self.err.clear();
@@ -512,30 +520,56 @@ impl App {
         }
         self.last_recruit_refresh = now;
 
+        // Region / Candidate 只有在榮冠 roster 已就緒時才讀取。
+        // 注意：這個門檻只限制招募資料，不影響上方兩個 exe runtime patch。
         let regions = match self.proc.as_ref() {
-            Some(p) => recruit_available_regions(p),
-            None => Vec::new(),
+            Some(p) if !koshien_roster(p).is_empty() => recruit_available_regions(p),
+            _ => Vec::new(),
         };
 
+        // 離開榮冠或 roster 尚未就緒時，立即清掉先前的 Region / Candidate 顯示。
+        if regions.is_empty() {
+            self.recruit_regions.clear();
+            self.recruit_list.clear();
+            self.recruit_sel = None;
+            self.recruit_cur = None;
+            self.recruit_loaded_region = None;
+            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            return;
+        }
+
         if regions != self.recruit_regions {
+            // 地區清單本身發生變化，就重新載入目前 Region 的候選人。
+            // 例如 Region 0 原本尚未探索時 recruit_loaded_region 已經是 Some(0)，
+            // 後來探索後 regions 從 [] 變成 [0]；若只比較 Region index，
+            // 會誤以為不需要 reload，造成「下拉選單有地區但球員列表仍是空的」。
             self.recruit_regions = regions;
-            let old_region = self.recruit_region;
             if !self.recruit_regions.contains(&self.recruit_region) {
                 if let Some(&r) = self.recruit_regions.first() {
                     self.recruit_region = r;
                 }
             }
-            if self.recruit_region != old_region
-                || self.recruit_loaded_region != Some(self.recruit_region)
-            {
-                self.reload_recruits();
-            }
+            self.reload_recruits();
         }
 
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
     }
 
     fn reload_recruits(&mut self) {
+        // 不在榮冠（或 roster 尚未就緒）時，絕不碰 Region / Candidate。
+        // 天才機率與招募機率 100% 是 exe patch，刻意不受此條件限制。
+        let roster_ready = self.proc.as_ref()
+            .is_some_and(|p| !koshien_roster(p).is_empty());
+        if !roster_ready {
+            self.recruit_regions.clear();
+            self.recruit_list.clear();
+            self.recruit_sel = None;
+            self.recruit_cur = None;
+            self.recruit_loaded_region = Some(self.recruit_region);
+            self.status = "讀不到部員名單 —— 現在不在栄冠(高中)模式? 新生招募地區尚未啟動".into();
+            return;
+        }
+
         if let Some(p) = self.proc.as_ref() {
             self.recruit_regions = recruit_available_regions(p);
             if !self.recruit_regions.contains(&self.recruit_region) {
@@ -1407,12 +1441,10 @@ impl eframe::App for App {
             let recruit_view = self.mode == Mode::Koshien
                 && self.koshien_roster_view == KoshienRosterView::Recruit;
 
+            // 招募／天才機率放在「新生招募」分頁內顯示，但它們都是直接修改 exe 的 runtime patch，
+            // 與 Region / Candidate Object 是否已生成完全無關。
+            // 即使目前沒有任何可招募地區／候選球員，也必須允許隨時操作。
             if recruit_view {
-                if self.recruit_regions.is_empty() {
-                    self.reload_recruits();
-                }
-                let old_region = self.recruit_region;
-
                 // 天才出現機率：直接修改原生 `cmp eax,1` 的門檻，0..100 對應 0%..100%。
                 ui.label("天才出現機率");
                 ui.horizontal(|ui| {
@@ -1424,6 +1456,7 @@ impl eframe::App for App {
                         .add(egui::DragValue::new(&mut v).range(0..=100).speed(1.0))
                         .changed();
                     ui.label("%");
+
                     if slider_changed || input_changed {
                         v = v.min(100);
                         if let Some(p) = self.proc.as_ref() {
@@ -1434,24 +1467,71 @@ impl eframe::App for App {
                                 }
                                 Err(e) => self.status = format!("天才機率修改失敗：{e}"),
                             }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改天才出現機率".into();
+                        }
+                    }
+
+                    // 只讀取目前遊戲 Process 的實際天才機率並同步 UI，不寫入。
+                    if ui.button("刷新").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match talent_rate(p) {
+                                Some(rate) => {
+                                    self.talent_rate = rate;
+                                    self.status = format!("已讀取目前天才出現機率：{rate}%");
+                                }
+                                None => self.status = "讀取目前天才出現機率失敗".into(),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法刷新天才出現機率".into();
+                        }
+                    }
+
+                    // 一鍵恢復遊戲原生天才機率 1%。
+                    if ui.button("恢復原始機率").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_talent_rate(p, TALENT_RATE_DEFAULT) {
+                                Ok(()) => {
+                                    self.talent_rate = TALENT_RATE_DEFAULT;
+                                    self.status = format!("天才出現機率已恢復為原始 {}%", TALENT_RATE_DEFAULT);
+                                }
+                                Err(e) => self.status = format!("恢復天才原始機率失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法恢復天才原始機率".into();
                         }
                     }
                 });
 
-                // 招募機率獨立一列，放在地區選擇上方。
                 let mut want = self.recruit_rate_100;
-                if ui.checkbox(&mut want, "招募機率(11月~2月間開啟) 100%").changed() {
+                if ui.checkbox(&mut want, "招募機率100%").changed() {
                     if let Some(p) = self.proc.as_ref() {
                         match set_recruit_rate_100(p, want) {
                             Ok(()) => {
                                 self.recruit_rate_100 = want;
-                                self.status = if want { "已啟用招募機率 100%".into() } else { "已還原原始招募機率".into() };
+                                self.status = if want {
+                                    "已啟用招募機率 100%".into()
+                                } else {
+                                    "已還原原始招募機率".into()
+                                };
                             }
                             Err(e) => self.status = format!("招募機率修改失敗：{e}"),
                         }
+                    } else {
+                        self.status = "尚未附加遊戲行程，無法修改招募機率".into();
                     }
                 }
                 ui.separator();
+            }
+
+            if recruit_view {
+                // 第一次進入新生招募頁時才立即嘗試讀一次；
+                // 若目前沒有候選人，不要每幀重跑並覆蓋其他功能的狀態訊息。
+                // 後續由 auto_refresh_recruit_regions() 每秒自動偵測。
+                if self.recruit_regions.is_empty() && self.recruit_loaded_region.is_none() {
+                    self.reload_recruits();
+                }
+                let old_region = self.recruit_region;
 
                 ui.horizontal(|ui| {
                     ui.label("可招募的地區");
@@ -3119,6 +3199,23 @@ impl App {
                 }
             }
         }
+    }
+}
+
+// 正常關閉修改器時：
+// 1. 若本次 UI 仍勾選「招募機率100%」，自動取消並還原原始指令。
+// 2. 若遊戲 process 仍存活，將天才出現機率恢復為遊戲原生 1%。
+// 不做任何啟動時或無條件的招募機率 code reset，避免碰到不屬於本修改器的外部 patch。
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(p) = self.proc.as_ref() {
+            if self.recruit_rate_100 {
+                let _ = set_recruit_rate_100(p, false);
+            }
+            let _ = set_talent_rate(p, TALENT_RATE_DEFAULT);
+        }
+        self.recruit_rate_100 = false;
+        self.talent_rate = TALENT_RATE_DEFAULT;
     }
 }
 
