@@ -1440,7 +1440,7 @@ impl eframe::App for App {
 
                 // 招募機率獨立一列，放在地區選擇上方。
                 let mut want = self.recruit_rate_100;
-                if ui.checkbox(&mut want, "招募機率 100%").changed() {
+                if ui.checkbox(&mut want, "招募機率(11月~2月間開啟) 100%").changed() {
                     if let Some(p) = self.proc.as_ref() {
                         match set_recruit_rate_100(p, want) {
                             Ok(()) => {
