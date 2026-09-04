@@ -540,9 +540,6 @@ impl App {
 
         if regions != self.recruit_regions {
             // 地區清單本身發生變化，就重新載入目前 Region 的候選人。
-            // 例如 Region 0 原本尚未探索時 recruit_loaded_region 已經是 Some(0)，
-            // 後來探索後 regions 從 [] 變成 [0]；若只比較 Region index，
-            // 會誤以為不需要 reload，造成「下拉選單有地區但球員列表仍是空的」。
             self.recruit_regions = regions;
             if !self.recruit_regions.contains(&self.recruit_region) {
                 if let Some(&r) = self.recruit_regions.first() {
@@ -550,6 +547,26 @@ impl App {
                 }
             }
             self.reload_recruits();
+        } else {
+            // Region 沒變時，每秒只做輕量 Candidate 比對。
+            // recruit_candidates() 只讀 10 個 pointer + 姓名；只有候選人的 index / pointer /
+            // 姓名真的改變時，才做完整 Player::load()，避免每秒重讀全部球員資料。
+            let candidate_changed = match self.proc.as_ref() {
+                Some(p) => {
+                    let live = recruit_candidates(p, self.recruit_region);
+                    live.len() != self.recruit_list.len()
+                        || live.iter().zip(self.recruit_list.iter()).any(|(&(index, candidate_addr, obj), old)| {
+                            index != old.index
+                                || candidate_addr != old.candidate_addr
+                                || obj != old.player.addr
+                                || read_name(p, obj) != old.player.name
+                        })
+                }
+                None => false,
+            };
+            if candidate_changed {
+                self.reload_recruits();
+            }
         }
 
         ctx.request_repaint_after(std::time::Duration::from_secs(1));
