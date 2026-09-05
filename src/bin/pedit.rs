@@ -260,12 +260,15 @@ struct App {
     recruit_list: Vec<RecruitEntry>,
     recruit_sel: Option<usize>,
     recruit_cur: Option<Player>,
-    /// 新生招募分頁開啟時，每 1 秒重新檢查可招募地區。
+    /// 新生招募分頁開啟時，每 2 秒檢查候選人並同步能力/總評。
     last_recruit_refresh: std::time::Instant,
     /// 榮冠 roster 尚未出現時，每 1 秒重試一次。
     last_koshien_retry: std::time::Instant,
     /// roster 已取得後，每 5 秒做一次輕量有效性檢查。
     last_koshien_validate: std::time::Instant,
+    /// 已知球員物件每 2 秒重新讀一次能力，讓清單總評跟遊戲內成長同步。
+    /// 這不是全記憶體掃描，只讀 self.list 已知的 Player Object。
+    last_koshien_stat_sync: std::time::Instant,
     filter: String,
     list: Vec<Player>,
     sel: Option<usize>,
@@ -331,6 +334,8 @@ impl App {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_fonts(&cc.egui_ctx);
         let libpath = origlib_path();
+        // 啟動時只附加遊戲，不主動檢查或改寫招募機率的程式碼。
+        // 招募機率 patch 的生命週期只由本次修改器 instance 的 checkbox 管理。
         let (proc, err) = match Proc::attach() {
             Ok(p) => (Some(p), String::new()),
             Err(e) => (None, e),
@@ -352,6 +357,7 @@ impl App {
             last_recruit_refresh: std::time::Instant::now(),
             last_koshien_retry: std::time::Instant::now(),
             last_koshien_validate: std::time::Instant::now(),
+            last_koshien_stat_sync: std::time::Instant::now(),
             filter: String::new(),
             list: Vec::new(),
             sel: None,
@@ -400,21 +406,27 @@ impl App {
         if self.proc_alive() {
             return true;
         }
+        // 如果這次修改器自己曾開啟招募機率 patch，先嘗試關閉。
+        // 若遊戲 process 已經真的消失，寫回會失敗也沒關係：process 結束後 patch 本身也不存在。
+        if self.recruit_rate_100 {
+            if let Some(p) = self.proc.as_ref() {
+                let _ = set_recruit_rate_100(p, false);
+            }
+            self.recruit_rate_100 = false;
+        }
         let old = self.proc.take().map(|p| p.pid);
-        // AOB 快取是以 pid 為 key，但遊戲重開後湊巧拿到同一個 pid 就會沿用舊結果。
-        // 重新附加本來就不在每幀路徑上，多掃一次很便宜。
-        koshien_cache_clear();
-        roster_cache_clear();
         self.recruit_loaded_region = None;
         self.recruit_list.clear();
         self.recruit_sel = None;
         self.recruit_cur = None;
         match Proc::attach() {
             Ok(p) => {
-                self.status = match old {
+                let attach_msg = match old {
                     Some(o) => format!("遊戲已重開（pid {o} → {}），已自動重新附加", p.pid),
                     None => format!("已附加 pid {}", p.pid),
                 };
+                self.status = attach_msg;
+                self.recruit_rate_100 = false;
                 self.talent_rate = talent_rate(&p).unwrap_or(TALENT_RATE_DEFAULT);
                 self.proc = Some(p);
                 self.err.clear();
@@ -456,8 +468,35 @@ impl App {
             return;
         }
 
+        // 已取得 roster 後，每 2 秒只重讀「已知 Player Object」的最新內容。
+        // 不掃描記憶體、不重建 roster，也不碰 growth structure；用途只是讓
+        // 遊戲內自然成長/能力變動後，清單上的 overall 最多約 2 秒就同步。
+        if now.duration_since(self.last_koshien_stat_sync) >= std::time::Duration::from_secs(2) {
+            self.last_koshien_stat_sync = now;
+            if let Some(p) = self.proc.as_ref() {
+                let selected = self.sel;
+                let mut selected_fresh: Option<Player> = None;
+                for (i, pl) in self.list.iter_mut().enumerate() {
+                    let addr = pl.addr;
+                    if let Some(fresh) = Player::load(p, addr) {
+                        // 位址與姓名都合理才覆蓋快照，避免畫面切換瞬間讀到別的物件。
+                        if fresh.addr == addr && fresh.name == pl.name {
+                            if selected == Some(i) {
+                                selected_fresh = Some(fresh.clone());
+                            }
+                            *pl = fresh;
+                        }
+                    }
+                }
+                // 選中的球員也要一起刷新右側編輯快照，避免舊 cur 與新 list 打架。
+                if let Some(fresh) = selected_fresh {
+                    self.cur = Some(fresh);
+                }
+            }
+        }
+
         if now.duration_since(self.last_koshien_validate) < std::time::Duration::from_secs(5) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
             return;
         }
         self.last_koshien_validate = now;
@@ -495,47 +534,108 @@ impl App {
             }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
     }
 
-    /// 新生招募分頁的輕量自動刷新：每 1 秒只重查「哪些 Region 已有候選人」。
-    /// 不每秒重建目前候選人列表，避免選中狀態一直被清掉；新地區出現後會自動加入下拉選單。
+    /// 新生招募分頁自動刷新：每 2 秒檢查 Candidate 是否換人，並同步目前候選人的能力/總評。
+    /// 只有 Candidate index / pointer / 姓名改變時才重建清單；平常只重讀這 10 位已知 Player Object。
     fn auto_refresh_recruit_regions(&mut self, ctx: &egui::Context) {
         if self.mode != Mode::Koshien || self.koshien_roster_view != KoshienRosterView::Recruit {
             return;
         }
 
         let now = std::time::Instant::now();
-        if now.duration_since(self.last_recruit_refresh) < std::time::Duration::from_secs(1) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        if now.duration_since(self.last_recruit_refresh) < std::time::Duration::from_secs(2) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
             return;
         }
         self.last_recruit_refresh = now;
 
+        // Region / Candidate 只有在榮冠 roster 已就緒時才讀取。
+        // 注意：這個門檻只限制招募資料，不影響上方兩個 exe runtime patch。
         let regions = match self.proc.as_ref() {
-            Some(p) => recruit_available_regions(p),
-            None => Vec::new(),
+            Some(p) if !koshien_roster(p).is_empty() => recruit_available_regions(p),
+            _ => Vec::new(),
         };
 
+        // 離開榮冠或 roster 尚未就緒時，立即清掉先前的 Region / Candidate 顯示。
+        if regions.is_empty() {
+            self.recruit_regions.clear();
+            self.recruit_list.clear();
+            self.recruit_sel = None;
+            self.recruit_cur = None;
+            self.recruit_loaded_region = None;
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
+            return;
+        }
+
         if regions != self.recruit_regions {
+            // 地區清單本身發生變化，就重新載入目前 Region 的候選人。
             self.recruit_regions = regions;
-            let old_region = self.recruit_region;
             if !self.recruit_regions.contains(&self.recruit_region) {
                 if let Some(&r) = self.recruit_regions.first() {
                     self.recruit_region = r;
                 }
             }
-            if self.recruit_region != old_region
-                || self.recruit_loaded_region != Some(self.recruit_region)
-            {
+            self.reload_recruits();
+        } else {
+            // Region 沒變時先確認 Candidate 本身是否換人。
+            let candidate_changed = match self.proc.as_ref() {
+                Some(p) => {
+                    let live = recruit_candidates(p, self.recruit_region);
+                    live.len() != self.recruit_list.len()
+                        || live.iter().zip(self.recruit_list.iter()).any(|(&(index, candidate_addr, obj), old)| {
+                            index != old.index
+                                || candidate_addr != old.candidate_addr
+                                || obj != old.player.addr
+                                || read_name(p, obj) != old.player.name
+                        })
+                }
+                None => false,
+            };
+
+            if candidate_changed {
                 self.reload_recruits();
+            } else if let Some(p) = self.proc.as_ref() {
+                // Candidate 沒換人：每 2 秒重讀已知 Player Object，更新能力與 overall。
+                // 若目前正選中某位候選人，右側 recruit_cur 也一起刷新，避免新舊快照互相覆蓋。
+                let selected = self.recruit_sel;
+                let mut selected_fresh: Option<Player> = None;
+                for (i, e) in self.recruit_list.iter_mut().enumerate() {
+                    let addr = e.player.addr;
+                    if let Some(fresh) = Player::load(p, addr) {
+                        if fresh.addr == addr && fresh.name == e.player.name {
+                            if selected == Some(i) {
+                                selected_fresh = Some(fresh.clone());
+                            }
+                            e.player = fresh;
+                        }
+                    }
+                }
+                if let Some(fresh) = selected_fresh {
+                    self.recruit_cur = Some(fresh);
+                }
             }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
     }
 
     fn reload_recruits(&mut self) {
+        // 不在榮冠（或 roster 尚未就緒）時，絕不碰 Region / Candidate。
+        // 天才機率與招募機率 100% 是 exe patch，刻意不受此條件限制。
+        let roster_ready = self.proc.as_ref()
+            .is_some_and(|p| !koshien_roster(p).is_empty());
+        if !roster_ready {
+            self.recruit_regions.clear();
+            self.recruit_list.clear();
+            self.recruit_sel = None;
+            self.recruit_cur = None;
+            self.recruit_loaded_region = Some(self.recruit_region);
+            self.status = "讀不到部員名單 —— 現在不在栄冠(高中)模式? 新生招募地區尚未啟動".into();
+            return;
+        }
+
         if let Some(p) = self.proc.as_ref() {
             self.recruit_regions = recruit_available_regions(p);
             if !self.recruit_regions.contains(&self.recruit_region) {
@@ -685,11 +785,26 @@ impl App {
     }
 
     fn reload_current(&mut self) {
-        if let (Some(p), Some(i)) = (&self.proc, self.sel) {
-            if let Some(pl) = self.list.get(i) {
-                self.cur = Player::load(p, pl.addr);
-                // 每幀呼叫 growth_struct_for 會一直 ReadProcessMemory, 在這裡算一次就好
-                self.growth_base = growth_struct_for(p, pl.addr);
+        let i = match self.sel {
+            Some(i) => i,
+            None => return,
+        };
+        let addr = match self.list.get(i) {
+            Some(pl) => pl.addr,
+            None => return,
+        };
+
+        // 重新讀取時不只更新右側編輯器的 cur，也同步更新左側清單的快照。
+        // player_row() 的總評是由 self.list[i].overall() 計算；若只更新 cur，
+        // 左側就會一直顯示選手剛載入時的舊總評。
+        let loaded = self.proc.as_ref().and_then(|p| Player::load(p, addr));
+        self.growth_base = self.proc.as_ref().and_then(|p| growth_struct_for(p, addr));
+        if let Some(pl) = loaded {
+            self.cur = Some(pl.clone());
+            if let Some(slot) = self.list.get_mut(i) {
+                if slot.addr == addr {
+                    *slot = pl;
+                }
             }
         }
     }
@@ -1005,24 +1120,36 @@ fn player_row(ui: &mut egui::Ui, pl: &Player, sel: bool, copies: usize, star: bo
                 egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
             ),
         );
-        let mut txt = if star { format!("★ {}", pl.name) } else { pl.name.clone() };
+
+        // 姓名與總評拆成固定寬度欄位；不再把兩者塞進同一個可變長字串。
+        // 這樣每列的「總評」起點與三位數字都會垂直對齊。
+        let name_txt = if star { format!("★ {}", pl.name) } else { pl.name.clone() };
+        let name_resp = ui.add_sized(
+            [92.0, 18.0],
+            egui::SelectableLabel::new(sel, name_txt),
+        );
+        let overall_resp = ui.add_sized(
+            [68.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("總評 {:>3}", pl.overall())).monospace()),
+        );
         if copies > 1 {
-            txt.push_str(&format!("　×{copies}"));
+            ui.add_sized([34.0, 18.0], egui::Label::new(format!("×{copies}")));
         }
-        let w = ui.available_width().max(40.0);
-        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, txt))
-            .on_hover_text(if star {
-                format!("物件 {:#x}\n★ 這份帶成長經驗值結構 ＝ 明星選手的主角，編輯要用這份", pl.addr)
-            } else {
-                format!("物件 {:#x}", pl.addr)
-            })
-            .clicked()
+
+        let hover = if star {
+            format!("物件 {:#x}\n★ 這份帶成長經驗值結構 ＝ 明星選手的主角，編輯要用這份", pl.addr)
+        } else {
+            format!("物件 {:#x}", pl.addr)
+        };
+        name_resp.clone().on_hover_text(&hover);
+        overall_resp.on_hover_text(&hover);
+        name_resp.clicked()
     })
     .inner
 }
 
 /// 栄冠「原始名單」的一列：保留 roster array 的原始 index，不做任何重新排序。
-/// 左側顯示 #00..、守備位置與姓名；hover 顯示 Player Object 位址。
+/// 左側顯示 #00..、守備位置、姓名與總評；欄位使用固定寬度。
 fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: bool) -> bool {
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -1035,14 +1162,22 @@ fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: boo
                 egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
             ),
         );
-        let w = ui.available_width().max(40.0);
-        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, &pl.name))
-            .on_hover_text(format!(
-                "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
-                pos_name(pl.pos),
-                pl.addr
-            ))
-            .clicked()
+        let name_resp = ui.add_sized(
+            [92.0, 18.0],
+            egui::SelectableLabel::new(sel, pl.name.clone()),
+        );
+        let overall_resp = ui.add_sized(
+            [68.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("總評 {:>3}", pl.overall())).monospace()),
+        );
+        let hover = format!(
+            "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
+            pos_name(pl.pos),
+            pl.addr
+        );
+        name_resp.clone().on_hover_text(&hover);
+        overall_resp.on_hover_text(&hover);
+        name_resp.clicked()
     })
     .inner
 }
@@ -1407,14 +1542,12 @@ impl eframe::App for App {
             let recruit_view = self.mode == Mode::Koshien
                 && self.koshien_roster_view == KoshienRosterView::Recruit;
 
+            // 招募／天才機率放在「新生招募」分頁內顯示，但它們都是直接修改 exe 的 runtime patch，
+            // 與 Region / Candidate Object 是否已生成完全無關。
+            // 即使目前沒有任何可招募地區／候選球員，也必須允許隨時操作。
             if recruit_view {
-                if self.recruit_regions.is_empty() {
-                    self.reload_recruits();
-                }
-                let old_region = self.recruit_region;
-
                 // 天才出現機率：直接修改原生 `cmp eax,1` 的門檻，0..100 對應 0%..100%。
-                ui.label("天才出現機率");
+                ui.label("天才出現機率（招募與新生，轉生除外）");
                 ui.horizontal(|ui| {
                     let mut v = self.talent_rate.min(100);
                     let slider_changed = ui
@@ -1424,6 +1557,7 @@ impl eframe::App for App {
                         .add(egui::DragValue::new(&mut v).range(0..=100).speed(1.0))
                         .changed();
                     ui.label("%");
+
                     if slider_changed || input_changed {
                         v = v.min(100);
                         if let Some(p) = self.proc.as_ref() {
@@ -1434,24 +1568,71 @@ impl eframe::App for App {
                                 }
                                 Err(e) => self.status = format!("天才機率修改失敗：{e}"),
                             }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改天才出現機率".into();
+                        }
+                    }
+
+                    // 只讀取目前遊戲 Process 的實際天才機率並同步 UI，不寫入。
+                    if ui.button("刷新").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match talent_rate(p) {
+                                Some(rate) => {
+                                    self.talent_rate = rate;
+                                    self.status = format!("已讀取目前天才出現機率：{rate}%");
+                                }
+                                None => self.status = "讀取目前天才出現機率失敗".into(),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法刷新天才出現機率".into();
+                        }
+                    }
+
+                    // 一鍵恢復遊戲原生天才機率 1%。
+                    if ui.button("恢復原始機率").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_talent_rate(p, TALENT_RATE_DEFAULT) {
+                                Ok(()) => {
+                                    self.talent_rate = TALENT_RATE_DEFAULT;
+                                    self.status = format!("天才出現機率已恢復為原始 {}%", TALENT_RATE_DEFAULT);
+                                }
+                                Err(e) => self.status = format!("恢復天才原始機率失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法恢復天才原始機率".into();
                         }
                     }
                 });
 
-                // 招募機率獨立一列，放在地區選擇上方。
                 let mut want = self.recruit_rate_100;
-                if ui.checkbox(&mut want, "招募機率 100%").changed() {
+                if ui.checkbox(&mut want, "招募機率100%").changed() {
                     if let Some(p) = self.proc.as_ref() {
                         match set_recruit_rate_100(p, want) {
                             Ok(()) => {
                                 self.recruit_rate_100 = want;
-                                self.status = if want { "已啟用招募機率 100%".into() } else { "已還原原始招募機率".into() };
+                                self.status = if want {
+                                    "已啟用招募機率 100%".into()
+                                } else {
+                                    "已還原原始招募機率".into()
+                                };
                             }
                             Err(e) => self.status = format!("招募機率修改失敗：{e}"),
                         }
+                    } else {
+                        self.status = "尚未附加遊戲行程，無法修改招募機率".into();
                     }
                 }
                 ui.separator();
+            }
+
+            if recruit_view {
+                // 第一次進入新生招募頁時才立即嘗試讀一次；
+                // 若目前沒有候選人，不要每幀重跑並覆蓋其他功能的狀態訊息。
+                // 後續由 auto_refresh_recruit_regions() 每 2 秒自動偵測與同步。
+                if self.recruit_regions.is_empty() && self.recruit_loaded_region.is_none() {
+                    self.reload_recruits();
+                }
+                let old_region = self.recruit_region;
 
                 ui.horizontal(|ui| {
                     ui.label("可招募的地區");
@@ -1491,16 +1672,24 @@ impl eframe::App for App {
                                     egui::RichText::new(pos_name(e.player.pos)).strong().color(pos_color(e.player.pos)),
                                 ),
                             );
-                            let w = ui.available_width().max(40.0);
-                            if ui.add_sized(
-                                [w, 18.0],
+                            // 跟一般球員清單一致：姓名與總評使用固定寬度欄位。
+                            let name_resp = ui.add_sized(
+                                [92.0, 18.0],
                                 egui::SelectableLabel::new(self.recruit_sel == Some(row), &e.player.name),
-                            )
-                            .on_hover_text(format!(
+                            );
+                            let overall_resp = ui.add_sized(
+                                [68.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("總評 {:>3}", e.player.overall())).monospace(),
+                                ),
+                            );
+                            let hover = format!(
                                 "Region {} / Candidate #{}\nCandidate: 0x{:X}\nPlayer Object: 0x{:X}",
                                 self.recruit_region, e.index, e.candidate_addr, e.player.addr
-                            ))
-                            .clicked() {
+                            );
+                            name_resp.clone().on_hover_text(&hover);
+                            overall_resp.on_hover_text(&hover);
+                            if name_resp.clicked() {
                                 pick = Some(row);
                             }
                         });
@@ -1708,6 +1897,7 @@ impl App {
         let mut cur = match self.recruit_cur.clone() { Some(v) => v, None => return };
         let obj = cur.addr;
         let mut act: Option<(bool, String)> = None;
+        let mut manual_reload = false;
         macro_rules! P { () => { match &self.proc { Some(p) => p, None => return } }; }
 
         let (cand_index, cand_addr) = self.recruit_sel
@@ -1723,6 +1913,7 @@ impl App {
             if ui.button("重新讀取").clicked() {
                 if let Some(pl) = Player::load(P!(), obj) {
                     cur = pl;
+                    manual_reload = true;
                 }
             }
         });
@@ -1877,13 +2068,23 @@ impl App {
             )).weak().small().monospace());
         });
 
+        // 候選人也採用與一般球員相同的同步原則：
+        // - 修改器自己寫入時，立即更新左側 recruit_list 的 overall。
+        // - 手動「重新讀取」時，也把新快照同步到左側。
+        // - 平常絕不每幀把 recruit_cur 灌回 recruit_list；遊戲自行成長由 2 秒同步負責。
+        if act.is_some() || manual_reload {
+            if let Some(i) = self.recruit_sel {
+                if let Some(e) = self.recruit_list.get_mut(i) {
+                    if e.player.addr == cur.addr {
+                        e.player = cur.clone();
+                    }
+                }
+            }
+        }
         if let Some((ok, what)) = act {
             self.status = if ok { format!("新生招募：已寫入 {what}") } else { format!("新生招募：寫入失敗 {what}") };
         }
-        self.recruit_cur = Some(cur.clone());
-        if let Some(i) = self.recruit_sel {
-            if let Some(e) = self.recruit_list.get_mut(i) { e.player = cur; }
-        }
+        self.recruit_cur = Some(cur);
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
@@ -3098,7 +3299,9 @@ impl App {
             }
         });
 
-        self.cur = Some(cur);
+        // cur 是右側編輯快照。不要每幀無條件灌回 self.list；
+        // 否則遊戲自然成長後，2 秒同步的新值會被舊 cur 反覆覆蓋。
+        self.cur = Some(cur.clone());
         if let Some(i) = switch {
             self.sel = Some(i);
             self.reload_current();
@@ -3119,6 +3322,23 @@ impl App {
                 }
             }
         }
+    }
+}
+
+// 正常關閉修改器時：
+// 1. 若本次 UI 仍勾選「招募機率100%」，自動取消並還原原始指令。
+// 2. 若遊戲 process 仍存活，將天才出現機率恢復為遊戲原生 1%。
+// 不做任何啟動時或無條件的招募機率 code reset，避免碰到不屬於本修改器的外部 patch。
+impl Drop for App {
+    fn drop(&mut self) {
+        if let Some(p) = self.proc.as_ref() {
+            if self.recruit_rate_100 {
+                let _ = set_recruit_rate_100(p, false);
+            }
+            let _ = set_talent_rate(p, TALENT_RATE_DEFAULT);
+        }
+        self.recruit_rate_100 = false;
+        self.talent_rate = TALENT_RATE_DEFAULT;
     }
 }
 
