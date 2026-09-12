@@ -830,6 +830,8 @@ pub struct Player {
     pub speed: u16,
     pub stamina: u16,
     pub pack_hi: u16,
+    /// Overall 計算使用的三個投手 packed 3-bit 欄位（P+28 DWORD bits22..30）。
+    pub pitch_traits: [u8; 3],
     pub grade: u8,
     /// 栄冠球員信賴度（0..=200）
     pub trust: u8,
@@ -936,6 +938,9 @@ impl Player {
         let u8a = |o: usize| b[o];
         let u16a = |o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
         let pack = u16::from_le_bytes([b[OFF_PACK], b[OFF_PACK + 1]]);
+        // 遊戲 Overall 計算器是從 P+28 起讀一個 DWORD：
+        // bits 8..14=球速 raw、15..21=耐力、22..24/25..27/28..30=三個投手 3-bit 欄位。
+        let pitcher_raw = u32::from_le_bytes([b[OFF_DEF], b[OFF_PACK], b[OFF_PACK + 1], b[OFF_PACK + 2]]);
         let mut pl = Player {
             addr: obj,
             name: name_from(b),
@@ -952,6 +957,11 @@ impl Player {
             speed: (pack & 0x7F) + 80,
             stamina: (pack >> 7) & 0x7F,
             pack_hi: pack & 0xC000,
+            pitch_traits: [
+                ((pitcher_raw >> 22) & 7) as u8,
+                ((pitcher_raw >> 25) & 7) as u8,
+                ((pitcher_raw >> 28) & 7) as u8,
+            ],
             grade: u8a(OFF_GRADE),
             trust: u8a(OFF_TRUST),
             personality: u8a(OFF_PERSONALITY),
@@ -991,6 +1001,306 @@ impl Player {
     /// 找出某個球種 slot 對應的原創球種記錄
     pub fn rec_for_slot(&self, slot: usize) -> Option<&OrigRec> {
         self.recs.iter().find(|r| r.slot == slot as u32)
+    }
+
+    /// 依目前已逆向出的遊戲公式，在修改器端直接計算總評（0..=999）。
+    ///
+    /// 這是不呼叫遊戲函式、不 hook / patch 的純本地計算。等同目前已確認的
+    /// `calc_player_overall(..., modifier=null, param_3=0)` 路徑。
+    ///
+    /// 尚待更多實機樣本驗證的只有極少數特殊球種/模式修正；一般 roster 顯示可先用它對照。
+    pub fn overall(&self) -> i32 {
+        fn rating(v: i32) -> i32 {
+            if v > 89 { ((v - 90) * 20) / 10 + 101 }
+            else if v > 79 { ((v - 80) * 18) / 10 + 83 }
+            else if v > 69 { ((v - 70) * 16) / 10 + 67 }
+            else if v > 59 { ((v - 60) * 14) / 10 + 53 }
+            else if v > 49 { ((v - 50) * 12) / 10 + 41 }
+            else if v > 39 { ((v - 40) * 11) / 10 + 30 }
+            else if v > 19 { v - 10 }
+            else { v / 2 }
+        }
+
+        fn speed_rating(v: i32) -> i32 {
+            if v > 169 { ((v - 170) * 24) / 5 + 151 }
+            else if v > 164 { ((v - 165) * 22) / 5 + 129 }
+            else if v > 159 { ((v - 160) * 20) / 5 + 109 }
+            else if v > 154 { ((v - 155) * 18) / 5 + 91 }
+            else if v > 149 { ((v - 150) * 16) / 5 + 75 }
+            else if v > 144 { ((v - 145) * 15) / 5 + 60 }
+            else if v > 139 { ((v - 140) * 14) / 5 + 46 }
+            else if v > 134 { ((v - 135) * 13) / 5 + 33 }
+            else if v > 129 { ((v - 130) * 12) / 5 + 21 }
+            else if v > 124 { ((v - 125) * 11) / 5 + 10 }
+            else { (v * 2 - 240).max(0) }
+        }
+
+        fn trait_rating(v: u8) -> i32 {
+            match v {
+                1 | 2 => 1,
+                3..=6 => 2,
+                7 => 4,
+                _ => 0,
+            }
+        }
+
+        fn signed_bits(v: u8, shift: u8, bits: u8) -> i32 {
+            let mask = (1u16 << bits) - 1;
+            let x = ((v as u16 >> shift) & mask) as i32;
+            let sign = 1i32 << (bits - 1);
+            if x & sign != 0 { x - (1i32 << bits) } else { x }
+        }
+
+        fn special_value(a: &[u8; ABIL_BYTES], id: usize) -> i32 {
+            match id {
+                0x00 => ((a[0x0d] >> 6) & 1) as i32,
+                0x01 => signed_bits(a[0x0b], 4, 2),
+                0x02 => signed_bits(a[0x05], 0, 3),
+                0x03 => ((a[0] >> 3) & 1) as i32,
+                0x04 => (a[0] >> 7) as i32,
+                0x05 => ((a[5] >> 4) & 3) as i32,
+                0x06 => ((a[1] >> 3) & 1) as i32,
+                0x07 => signed_bits(a[0], 0, 3),
+                0x08 => signed_bits(a[0], 4, 3),
+                0x09 => (a[1] >> 7) as i32,
+                0x0a => ((a[2] >> 3) & 1) as i32,
+                0x0b => (a[2] >> 7) as i32,
+                0x0c => ((a[3] >> 3) & 1) as i32,
+                0x0d => signed_bits(a[5], 6, 2),
+                0x0e => (a[3] >> 7) as i32,
+                0x0f => (a[6] & 3) as i32,
+                0x10 => ((a[4] >> 3) & 1) as i32,
+                0x11 => (a[4] >> 7) as i32,
+                0x12 => signed_bits(a[6], 2, 2),
+                0x13 => ((a[5] >> 3) & 1) as i32,
+                0x14 => ((a[0x0b] >> 6) & 1) as i32,
+                0x15 => signed_bits(a[6], 4, 2),
+                0x16 => (a[0x0b] >> 7) as i32,
+                0x17 => (a[0x0c] & 1) as i32,
+                0x18 => (a[6] >> 6) as i32,
+                0x19 => signed_bits(a[7], 6, 2),
+                0x1a => ((a[0x0c] >> 3) & 1) as i32,
+                0x1b => signed_bits(a[8], 0, 2),
+                0x1c => signed_bits(a[8], 2, 2),
+                0x1d => ((a[0x0c] >> 4) & 1) as i32,
+                0x1e => ((a[8] >> 4) & 3) as i32,
+                0x1f => ((a[0x0c] >> 5) & 1) as i32,
+                0x20 => (a[8] >> 6) as i32,
+                0x21 => signed_bits(a[1], 0, 3),
+                0x22 => signed_bits(a[9], 0, 2),
+                0x23 => signed_bits(a[1], 4, 3),
+                0x24 => signed_bits(a[9], 2, 2),
+                0x25 => signed_bits(a[2], 0, 3),
+                0x26 => signed_bits(a[2], 4, 3),
+                0x27 => signed_bits(a[9], 4, 2),
+                0x28 => signed_bits(a[9], 6, 2),
+                0x29 => ((a[0x0c] >> 6) & 1) as i32,
+                0x2a => signed_bits(a[10], 0, 2),
+                0x2b => (a[0x0c] >> 7) as i32,
+                0x2c => signed_bits(a[10], 2, 2),
+                0x2d => signed_bits(a[10], 4, 2),
+                0x2e => signed_bits(a[10], 6, 2),
+                0x2f => signed_bits(a[0x0b], 0, 2),
+                0x30 => (a[0x0d] & 1) as i32,
+                0x31 => ((a[0x0d] >> 1) & 1) as i32,
+                0x32 => signed_bits(a[3], 0, 3),
+                0x33 => signed_bits(a[3], 4, 3),
+                0x34 => ((a[0x0d] >> 2) & 1) as i32,
+                0x35 => ((a[0x0d] >> 3) & 1) as i32,
+                0x36 => signed_bits(a[0x0b], 2, 2),
+                0x37 => signed_bits(a[4], 0, 3),
+                0x38 => signed_bits(a[4], 4, 3),
+                0x39 => ((a[0x0d] >> 4) & 1) as i32,
+                0x3a => ((a[0x0d] >> 5) & 1) as i32,
+                0x3b => signed_bits(a[7], 0, 2),
+                0x3c => ((a[0x0c] >> 1) & 1) as i32,
+                0x3d => signed_bits(a[7], 2, 2),
+                0x3e => ((a[7] >> 4) & 3) as i32,
+                0x3f => ((a[0x0c] >> 2) & 1) as i32,
+                0x40 => (a[0x0d] >> 7) as i32,
+                _ => 0,
+            }
+        }
+
+        fn special_raw(id: usize, v: i32) -> i32 {
+            if v == 0 { return 0; }
+            match id {
+                0x00 | 0x01 | 0x0e | 0x1b | 0x31 | 0x34 | 0x39 | 0x3a | 0x3c => 10,
+                0x02 | 0x26 => v * 15,
+                0x03 | 0x1a | 0x1d | 0x21 | 0x23 | 0x30 | 0x3f => 50,
+                0x04 => 20,
+                0x05 => match v { 1 => 25, 2 => 50, _ => 0 },
+                0x06 | 0x40 => 60,
+                0x07 | 0x18 | 0x28 | 0x2e | 0x32 | 0x33 | 0x36 | 0x37 | 0x3e => v * 25,
+                0x08 | 0x25 | 0x38 | 0x3b => v * 30,
+                0x09 | 0x0b | 0x0c | 0x0d | 0x10 | 0x11 | 0x17 | 0x1f | 0x29 | 0x35 => 25,
+                0x0a | 0x13 | 0x14 | 0x16 | 0x2b => 15,
+                0x0f | 0x1e => match v { 1 => 40, 2 => 100, _ => 0 },
+                0x12 => match v { -1 => 40, 1 => 100, _ => 0 },
+                0x15 | 0x22 => match v { -1 => -30, 1 => 25, _ => 0 },
+                0x19 | 0x24 | 0x2a | 0x2c | 0x2d => -25,
+                0x1c => v * 50,
+                0x20 | 0x3d => v * 10,
+                0x27 => match v { -1 => 20, 1 => 60, _ => 0 },
+                0x2f => -40,
+                _ => 0,
+            }
+        }
+
+        fn special_quarter(id: usize, a: &[u8; ABIL_BYTES]) -> i32 {
+            let raw = special_raw(id, special_value(a, id));
+            if raw == 0 { 0 } else {
+                let q = raw / 4; // Rust i32 跟 C 一樣向 0 截斷
+                if q == 0 { if raw >= 0 { 1 } else { -1 } } else { q }
+            }
+        }
+
+        fn pitch_power_rating(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 3, 3 => 6, 4 => 15, 5 => 30, 6 => 60, 7 => 90, _ => 0,
+            }
+        }
+        fn pitch_move_bonus(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 3, 3 => 5, 4 => 12, 5 => 18, 6 => 25, 7 => 32, _ => 0,
+            }
+        }
+        fn pitch_control_bonus(v: u8) -> i32 {
+            match v & 7 {
+                1 => 1, 2 => 2, 3 => 4, 4 => 6, 5 => 9, 6 => 12, 7 => 18, _ => 0,
+            }
+        }
+
+        let stat = |i: usize| self.stats[i].min(99) as i32;
+        let pos_rating = |p: usize| -> i32 {
+            if p == 0 {
+                if self.pos == 0 { self.defense as i32 } else { 0 }
+            } else {
+                self.field.get(p - 1).copied().unwrap_or(0) as i32
+            }
+        };
+
+        // calc_player_overall 的共通部分：疲勞消除 40% + 特定共通特殊能力。
+        let mut common = rating(stat(7)) * 40 / 100;
+        for id in [0usize, 1, 2, 0x3d] {
+            common += special_quarter(id, &self.abil);
+        }
+
+        // calc_fielder_component (FUN_145ABE560)
+        let cr = rating(stat(0));
+        let cl = rating(stat(1));
+        let power = rating(stat(2));
+        let speed = rating(stat(3));
+        let arm = rating(stat(4));
+        let throw_ = rating(stat(5));
+        let catch = rating(stat(6));
+
+        let mut field_sum = 0;
+        for p in 1..=8usize {
+            let mut x = rating(pos_rating(p));
+            if p as u8 != self.pos { x /= 10; }
+            field_sum += x;
+        }
+
+        let mut fielder = ((cl + cr) * 140) / 200
+            + power * 160 / 100
+            + speed * 50 / 100
+            + field_sum * 50 / 100
+            + throw_ * 40 / 100
+            + catch * 40 / 100
+            + arm * 40 / 100;
+
+        let catcher_fit = pos_rating(1);
+        if catcher_fit != 0 {
+            let catcher_mul = (catcher_fit / 20).clamp(1, 4);
+            let call_bonus = match self.catcher {
+                1 => 1, 2 => 3, 3 => 5, 4 => 8, 5 => 12, 6 => 17, 7 => 23, _ => 0,
+            };
+            fielder += ((arm / 3) * catcher_fit) / 100 + call_bonus * catcher_mul;
+        }
+
+        // 原函式一般先 +3；只有 P+2C/P+2D 的位元組合 0x080（低仰角）不加。
+        if self.batting_style != 1 {
+            fielder += 3;
+        }
+
+        const FIELDER_SPECIALS: &[usize] = &[
+            0x03,0x04,0x05,0x06,0x07,0x08,0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10,
+            0x11,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x34,0x35,0x36,0x37,0x38,0x39,
+            0x3a,0x3c,0x3e,0x3f,0x40,
+        ];
+        for &id in FIELDER_SPECIALS {
+            fielder += special_quarter(id, &self.abil);
+        }
+
+        if self.pos != 0 {
+            return (common + fielder).clamp(0, 999);
+        }
+
+        // calc_pitcher_component (FUN_145ABE8E0)
+        let mut pitcher_base = speed_rating(self.speed as i32);
+        pitcher_base += self.pitch_traits.iter().copied().map(trait_rating).sum::<i32>();
+        pitcher_base += rating(self.stamina as i32) * 50 / 100;
+        pitcher_base += rating(pos_rating(0)) * 30 / 100;
+
+        let mut pitch_scores = Vec::with_capacity(N_BALL);
+        for (slot, b) in self.balls.iter().take(N_BALL).enumerate() {
+            let id = b.id & 0x7f;
+            if id == BALL_EMPTY { continue; }
+
+            let mut score = pitch_power_rating(b.power);
+            if slot == 5 || slot == 11 {
+                score = score * 150 / 100;
+            } else {
+                // FUN_145AF5330(type)==5 就是不使用變化量；現有 ball_dir 的 5 即直球系。
+                if ball_dir(id) != Some(5) {
+                    score += pitch_move_bonus(b.move_);
+                }
+            }
+            score += pitch_control_bonus(b.control);
+
+            if matches!(id, 2 | 7 | 12 | 22 | 27 | 28 | 32 | 36 | 38 | 39) {
+                score += 3;
+            } else if matches!(id, 13 | 16 | 41 | 42 | 43) {
+                score += 5;
+            }
+            pitch_scores.push(score);
+        }
+        pitch_scores.sort_unstable_by(|a, b| b.cmp(a));
+        pitch_scores.truncate(10);
+
+        let mut pitch_total = 0;
+        for (i, &score) in pitch_scores.iter().enumerate() {
+            if score == 0 { continue; }
+            let weight = if i < 3 { 100 } else { (120 - (i as i32) * 10).max(10) };
+            pitch_total += score * weight / 100;
+        }
+        if pitch_total > 300 {
+            pitch_total = 300 + (pitch_total - 300) / 2;
+        }
+
+        let mut pitcher = pitcher_base + pitch_total - 4;
+        const PITCHER_SPECIALS: &[usize] = &[
+            0x19,0x1a,0x1b,0x1c,0x1d,0x1e,0x1f,0x20,0x21,0x22,0x23,0x24,0x25,0x26,
+            0x27,0x28,0x29,0x2a,0x2b,0x2c,0x2d,0x2e,0x2f,0x30,0x31,0x32,0x33,0x3b,
+        ];
+        for &id in PITCHER_SPECIALS {
+            pitcher += special_quarter(id, &self.abil);
+        }
+
+        // param_3=0 的二刀流加成路徑。
+        let best_field = self.field.iter().copied().max().unwrap_or(0) as i32;
+        let batting_sum = stat(0) + stat(1) + stat(2);
+        if best_field >= 20 && batting_sum >= 150 {
+            let w = (best_field + batting_sum) / 8;
+            let hybrid = fielder * w / 100 + pitcher * (100 - w / 3) / 100;
+            if hybrid > pitcher {
+                return (common + hybrid).clamp(0, 999);
+            }
+        }
+
+        let overall = common + pitcher + throw_ * 20 / 100 + catch * 20 / 100 + arm * 20 / 100;
+        overall.clamp(0, 999)
     }
 
     pub fn ball_label(&self, slot: usize) -> String {

@@ -260,12 +260,15 @@ struct App {
     recruit_list: Vec<RecruitEntry>,
     recruit_sel: Option<usize>,
     recruit_cur: Option<Player>,
-    /// 新生招募分頁開啟時，每 1 秒重新檢查可招募地區。
+    /// 新生招募分頁開啟時，每 2 秒檢查候選人並同步能力/總評。
     last_recruit_refresh: std::time::Instant,
     /// 榮冠 roster 尚未出現時，每 1 秒重試一次。
     last_koshien_retry: std::time::Instant,
     /// roster 已取得後，每 5 秒做一次輕量有效性檢查。
     last_koshien_validate: std::time::Instant,
+    /// 已知球員物件每 2 秒重新讀一次能力，讓清單總評跟遊戲內成長同步。
+    /// 這不是全記憶體掃描，只讀 self.list 已知的 Player Object。
+    last_koshien_stat_sync: std::time::Instant,
     filter: String,
     list: Vec<Player>,
     sel: Option<usize>,
@@ -354,6 +357,7 @@ impl App {
             last_recruit_refresh: std::time::Instant::now(),
             last_koshien_retry: std::time::Instant::now(),
             last_koshien_validate: std::time::Instant::now(),
+            last_koshien_stat_sync: std::time::Instant::now(),
             filter: String::new(),
             list: Vec::new(),
             sel: None,
@@ -464,8 +468,35 @@ impl App {
             return;
         }
 
+        // 已取得 roster 後，每 2 秒只重讀「已知 Player Object」的最新內容。
+        // 不掃描記憶體、不重建 roster，也不碰 growth structure；用途只是讓
+        // 遊戲內自然成長/能力變動後，清單上的 overall 最多約 2 秒就同步。
+        if now.duration_since(self.last_koshien_stat_sync) >= std::time::Duration::from_secs(2) {
+            self.last_koshien_stat_sync = now;
+            if let Some(p) = self.proc.as_ref() {
+                let selected = self.sel;
+                let mut selected_fresh: Option<Player> = None;
+                for (i, pl) in self.list.iter_mut().enumerate() {
+                    let addr = pl.addr;
+                    if let Some(fresh) = Player::load(p, addr) {
+                        // 位址與姓名都合理才覆蓋快照，避免畫面切換瞬間讀到別的物件。
+                        if fresh.addr == addr && fresh.name == pl.name {
+                            if selected == Some(i) {
+                                selected_fresh = Some(fresh.clone());
+                            }
+                            *pl = fresh;
+                        }
+                    }
+                }
+                // 選中的球員也要一起刷新右側編輯快照，避免舊 cur 與新 list 打架。
+                if let Some(fresh) = selected_fresh {
+                    self.cur = Some(fresh);
+                }
+            }
+        }
+
         if now.duration_since(self.last_koshien_validate) < std::time::Duration::from_secs(5) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
             return;
         }
         self.last_koshien_validate = now;
@@ -503,19 +534,19 @@ impl App {
             }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
     }
 
-    /// 新生招募分頁的輕量自動刷新：每 1 秒只重查「哪些 Region 已有候選人」。
-    /// 不每秒重建目前候選人列表，避免選中狀態一直被清掉；新地區出現後會自動加入下拉選單。
+    /// 新生招募分頁自動刷新：每 2 秒檢查 Candidate 是否換人，並同步目前候選人的能力/總評。
+    /// 只有 Candidate index / pointer / 姓名改變時才重建清單；平常只重讀這 10 位已知 Player Object。
     fn auto_refresh_recruit_regions(&mut self, ctx: &egui::Context) {
         if self.mode != Mode::Koshien || self.koshien_roster_view != KoshienRosterView::Recruit {
             return;
         }
 
         let now = std::time::Instant::now();
-        if now.duration_since(self.last_recruit_refresh) < std::time::Duration::from_secs(1) {
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        if now.duration_since(self.last_recruit_refresh) < std::time::Duration::from_secs(2) {
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
             return;
         }
         self.last_recruit_refresh = now;
@@ -534,7 +565,7 @@ impl App {
             self.recruit_sel = None;
             self.recruit_cur = None;
             self.recruit_loaded_region = None;
-            ctx.request_repaint_after(std::time::Duration::from_secs(1));
+            ctx.request_repaint_after(std::time::Duration::from_secs(2));
             return;
         }
 
@@ -548,9 +579,7 @@ impl App {
             }
             self.reload_recruits();
         } else {
-            // Region 沒變時，每秒只做輕量 Candidate 比對。
-            // recruit_candidates() 只讀 10 個 pointer + 姓名；只有候選人的 index / pointer /
-            // 姓名真的改變時，才做完整 Player::load()，避免每秒重讀全部球員資料。
+            // Region 沒變時先確認 Candidate 本身是否換人。
             let candidate_changed = match self.proc.as_ref() {
                 Some(p) => {
                     let live = recruit_candidates(p, self.recruit_region);
@@ -564,12 +593,32 @@ impl App {
                 }
                 None => false,
             };
+
             if candidate_changed {
                 self.reload_recruits();
+            } else if let Some(p) = self.proc.as_ref() {
+                // Candidate 沒換人：每 2 秒重讀已知 Player Object，更新能力與 overall。
+                // 若目前正選中某位候選人，右側 recruit_cur 也一起刷新，避免新舊快照互相覆蓋。
+                let selected = self.recruit_sel;
+                let mut selected_fresh: Option<Player> = None;
+                for (i, e) in self.recruit_list.iter_mut().enumerate() {
+                    let addr = e.player.addr;
+                    if let Some(fresh) = Player::load(p, addr) {
+                        if fresh.addr == addr && fresh.name == e.player.name {
+                            if selected == Some(i) {
+                                selected_fresh = Some(fresh.clone());
+                            }
+                            e.player = fresh;
+                        }
+                    }
+                }
+                if let Some(fresh) = selected_fresh {
+                    self.recruit_cur = Some(fresh);
+                }
             }
         }
 
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        ctx.request_repaint_after(std::time::Duration::from_secs(2));
     }
 
     fn reload_recruits(&mut self) {
@@ -736,11 +785,26 @@ impl App {
     }
 
     fn reload_current(&mut self) {
-        if let (Some(p), Some(i)) = (&self.proc, self.sel) {
-            if let Some(pl) = self.list.get(i) {
-                self.cur = Player::load(p, pl.addr);
-                // 每幀呼叫 growth_struct_for 會一直 ReadProcessMemory, 在這裡算一次就好
-                self.growth_base = growth_struct_for(p, pl.addr);
+        let i = match self.sel {
+            Some(i) => i,
+            None => return,
+        };
+        let addr = match self.list.get(i) {
+            Some(pl) => pl.addr,
+            None => return,
+        };
+
+        // 重新讀取時不只更新右側編輯器的 cur，也同步更新左側清單的快照。
+        // player_row() 的總評是由 self.list[i].overall() 計算；若只更新 cur，
+        // 左側就會一直顯示選手剛載入時的舊總評。
+        let loaded = self.proc.as_ref().and_then(|p| Player::load(p, addr));
+        self.growth_base = self.proc.as_ref().and_then(|p| growth_struct_for(p, addr));
+        if let Some(pl) = loaded {
+            self.cur = Some(pl.clone());
+            if let Some(slot) = self.list.get_mut(i) {
+                if slot.addr == addr {
+                    *slot = pl;
+                }
             }
         }
     }
@@ -1056,24 +1120,36 @@ fn player_row(ui: &mut egui::Ui, pl: &Player, sel: bool, copies: usize, star: bo
                 egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
             ),
         );
-        let mut txt = if star { format!("★ {}", pl.name) } else { pl.name.clone() };
+
+        // 姓名與總評拆成固定寬度欄位；不再把兩者塞進同一個可變長字串。
+        // 這樣每列的「總評」起點與三位數字都會垂直對齊。
+        let name_txt = if star { format!("★ {}", pl.name) } else { pl.name.clone() };
+        let name_resp = ui.add_sized(
+            [92.0, 18.0],
+            egui::SelectableLabel::new(sel, name_txt),
+        );
+        let overall_resp = ui.add_sized(
+            [68.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("總評 {:>3}", pl.overall())).monospace()),
+        );
         if copies > 1 {
-            txt.push_str(&format!("　×{copies}"));
+            ui.add_sized([34.0, 18.0], egui::Label::new(format!("×{copies}")));
         }
-        let w = ui.available_width().max(40.0);
-        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, txt))
-            .on_hover_text(if star {
-                format!("物件 {:#x}\n★ 這份帶成長經驗值結構 ＝ 明星選手的主角，編輯要用這份", pl.addr)
-            } else {
-                format!("物件 {:#x}", pl.addr)
-            })
-            .clicked()
+
+        let hover = if star {
+            format!("物件 {:#x}\n★ 這份帶成長經驗值結構 ＝ 明星選手的主角，編輯要用這份", pl.addr)
+        } else {
+            format!("物件 {:#x}", pl.addr)
+        };
+        name_resp.clone().on_hover_text(&hover);
+        overall_resp.on_hover_text(&hover);
+        name_resp.clicked()
     })
     .inner
 }
 
 /// 栄冠「原始名單」的一列：保留 roster array 的原始 index，不做任何重新排序。
-/// 左側顯示 #00..、守備位置與姓名；hover 顯示 Player Object 位址。
+/// 左側顯示 #00..、守備位置、姓名與總評；欄位使用固定寬度。
 fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: bool) -> bool {
     ui.horizontal(|ui| {
         ui.add_sized(
@@ -1086,14 +1162,22 @@ fn raw_koshien_player_row(ui: &mut egui::Ui, index: usize, pl: &Player, sel: boo
                 egui::RichText::new(pos_name(pl.pos)).strong().color(pos_color(pl.pos)),
             ),
         );
-        let w = ui.available_width().max(40.0);
-        ui.add_sized([w, 18.0], egui::SelectableLabel::new(sel, &pl.name))
-            .on_hover_text(format!(
-                "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
-                pos_name(pl.pos),
-                pl.addr
-            ))
-            .clicked()
+        let name_resp = ui.add_sized(
+            [92.0, 18.0],
+            egui::SelectableLabel::new(sel, pl.name.clone()),
+        );
+        let overall_resp = ui.add_sized(
+            [68.0, 18.0],
+            egui::Label::new(egui::RichText::new(format!("總評 {:>3}", pl.overall())).monospace()),
+        );
+        let hover = format!(
+            "Roster index #{index:02}\n守備位置：{}\nPlayer Object {:#x}",
+            pos_name(pl.pos),
+            pl.addr
+        );
+        name_resp.clone().on_hover_text(&hover);
+        overall_resp.on_hover_text(&hover);
+        name_resp.clicked()
     })
     .inner
 }
@@ -1544,7 +1628,7 @@ impl eframe::App for App {
             if recruit_view {
                 // 第一次進入新生招募頁時才立即嘗試讀一次；
                 // 若目前沒有候選人，不要每幀重跑並覆蓋其他功能的狀態訊息。
-                // 後續由 auto_refresh_recruit_regions() 每秒自動偵測。
+                // 後續由 auto_refresh_recruit_regions() 每 2 秒自動偵測與同步。
                 if self.recruit_regions.is_empty() && self.recruit_loaded_region.is_none() {
                     self.reload_recruits();
                 }
@@ -1588,16 +1672,24 @@ impl eframe::App for App {
                                     egui::RichText::new(pos_name(e.player.pos)).strong().color(pos_color(e.player.pos)),
                                 ),
                             );
-                            let w = ui.available_width().max(40.0);
-                            if ui.add_sized(
-                                [w, 18.0],
+                            // 跟一般球員清單一致：姓名與總評使用固定寬度欄位。
+                            let name_resp = ui.add_sized(
+                                [92.0, 18.0],
                                 egui::SelectableLabel::new(self.recruit_sel == Some(row), &e.player.name),
-                            )
-                            .on_hover_text(format!(
+                            );
+                            let overall_resp = ui.add_sized(
+                                [68.0, 18.0],
+                                egui::Label::new(
+                                    egui::RichText::new(format!("總評 {:>3}", e.player.overall())).monospace(),
+                                ),
+                            );
+                            let hover = format!(
                                 "Region {} / Candidate #{}\nCandidate: 0x{:X}\nPlayer Object: 0x{:X}",
                                 self.recruit_region, e.index, e.candidate_addr, e.player.addr
-                            ))
-                            .clicked() {
+                            );
+                            name_resp.clone().on_hover_text(&hover);
+                            overall_resp.on_hover_text(&hover);
+                            if name_resp.clicked() {
                                 pick = Some(row);
                             }
                         });
@@ -1799,12 +1891,15 @@ impl eframe::App for App {
 
 impl App {
     /// 新生招募候選人只顯示/編輯已確認與一般 Player Object 共用的區域：
-    /// 主守位、投手/野手守備適性、八項能力、球速/耐力、捕手配球、特殊能力。
+    /// 主守位、投手/野手守備適性、八項能力、球速/耐力、捕手配球、球種、特殊能力。
     /// 不顯示性格/學力/年級等尚未確認能否直接沿用的欄位。
     fn recruit_editor(&mut self, ui: &mut egui::Ui) {
         let mut cur = match self.recruit_cur.clone() { Some(v) => v, None => return };
         let obj = cur.addr;
         let mut act: Option<(bool, String)> = None;
+        let mut manual_reload = false;
+        // 原創球種記錄或球種 ID 改變後要從記憶體重讀，避免 cur.recs 快照過期。
+        let mut need_pitch_reload = false;
         macro_rules! P { () => { match &self.proc { Some(p) => p, None => return } }; }
 
         let (cand_index, cand_addr) = self.recruit_sel
@@ -1820,6 +1915,7 @@ impl App {
             if ui.button("重新讀取").clicked() {
                 if let Some(pl) = Player::load(P!(), obj) {
                     cur = pl;
+                    manual_reload = true;
                 }
             }
         });
@@ -1922,6 +2018,199 @@ impl App {
             });
         });
 
+        // ── 新生招募球種：UI 與一般球員相同。
+        // Candidate 的 obj 已經是 C+0x18 的 embedded Player Object，OFF_BALL / OFF_ORIG 可直接沿用。
+        egui::CollapsingHeader::new("球種").default_open(true).show(ui, |ui| {
+            ui.checkbox(&mut self.cross_dir,
+                        "允許跨系統（遊戲不擋，但畫面會出現「直球位置放滑球」這種怪東西）");
+            ui.separator();
+            for dir in DIR_ORDER {
+                for second in [false, true] {
+                    let slot = dir + if second { 6 } else { 0 };
+                    let tag = format!("{}・第{}顆", DIR_SERIES[dir], if second { 2 } else { 1 });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!(
+                            "{}{}", DIR_SERIES[dir], if second { "・第2顆" } else { "・第1顆" }))
+                            .strong());
+                        ui.label(egui::RichText::new(format!("{}　slot{slot}", DIR_UI[dir]))
+                            .weak().small());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let opts: Vec<u8> = if self.cross_dir {
+                            let mut v = vec![BALL_EMPTY, BALL_ORIGINAL];
+                            v.extend(BALL_NAMES.iter().map(|e| e.0).filter(|&i| i != BALL_ORIGINAL));
+                            v
+                        } else {
+                            balls_for_dir(dir)
+                        };
+                        let mut id = cur.balls[slot].id;
+                        egui::ComboBox::from_id_source(("recruit_ball", obj, slot))
+                            .width(210.0)
+                            .selected_text(cur.ball_label(slot))
+                            .show_ui(ui, |ui| {
+                                for o in opts {
+                                    let txt = if o == BALL_ORIGINAL {
+                                        "原創球種（下面選要哪一顆）".to_string()
+                                    } else {
+                                        ball_name(o)
+                                    };
+                                    ui.selectable_value(&mut id, o, txt);
+                                }
+                            });
+                        if id != cur.balls[slot].id {
+                            let was_orig = cur.balls[slot].id == BALL_ORIGINAL;
+                            cur.balls[slot].id = id;
+                            if id != BALL_EMPTY && cur.balls[slot].power == 0 {
+                                cur.balls[slot].power = 7;
+                                cur.balls[slot].control = 7;
+                                cur.balls[slot].move_ = if dir == 5 { 0 } else { 4 };
+                            }
+                            let b = cur.balls[slot].clone();
+                            // Candidate 沒有明星選手的成長經驗值同步需求，直接寫 Player Object 球種欄位。
+                            let mut ok = write_ball(P!(), obj, slot, &b);
+                            if was_orig && id != BALL_ORIGINAL {
+                                if let Some(ri) = cur.recs.iter().position(|r| r.slot == slot as u32) {
+                                    ok &= clear_rec(P!(), obj, ri);
+                                    need_pitch_reload = true;
+                                }
+                            }
+                            act = Some((ok, format!("{tag} 球種")));
+                        }
+
+                        if cur.balls[slot].id != BALL_EMPTY {
+                            let mut changed = false;
+                            ui.label("球威");
+                            if let Some(n) = grade_btn(ui, cur.balls[slot].power, &GS_OPTS, 46.0) {
+                                cur.balls[slot].power = n;
+                                changed = true;
+                            }
+                            ui.label("控球");
+                            if let Some(n) = grade_btn(ui, cur.balls[slot].control, &GS_OPTS, 46.0) {
+                                cur.balls[slot].control = n;
+                                changed = true;
+                            }
+                            if dir != 5 {
+                                ui.label("變化量");
+                                let mut mv = cur.balls[slot].move_;
+                                if ui.add(egui::Slider::new(&mut mv, 0..=7).show_value(true)).changed() {
+                                    cur.balls[slot].move_ = mv;
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                let b = cur.balls[slot].clone();
+                                let ok = write_ball(P!(), obj, slot, &b);
+                                act = Some((ok, format!("{tag} 球威/控球/變化")));
+                            }
+                        }
+                    });
+
+                    // 原創球種的選擇方式與一般球員相同。
+                    if cur.balls[slot].id == BALL_ORIGINAL {
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            if self.lib.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(230, 170, 80),
+                                    "沒有球種庫 → 畫面只會顯示「原創」。按最上面的「⟳ 蒐集原創球種到球種庫」",
+                                );
+                                return;
+                            }
+                            let curname = cur
+                                .rec_for_slot(slot)
+                                .map(|r| r.name.clone())
+                                .unwrap_or_default();
+                            let opts: Vec<usize> = (0..self.lib.len())
+                                .filter(|&i| self.cross_dir || self.lib[i].dir == dir)
+                                .collect();
+                            let sel_txt = if curname.is_empty() {
+                                "（未設定→畫面只顯示「原創」，點這裡挑一顆）".to_string()
+                            } else {
+                                zh_name(&curname)
+                            };
+                            let mut pick: Option<usize> = None;
+                            ui.label("↳ 原創內容");
+                            egui::ComboBox::from_id_source(("recruit_orig", obj, slot))
+                                .width(330.0)
+                                .selected_text(sel_txt)
+                                .show_ui(ui, |ui| {
+                                    for i in opts {
+                                        let e = &self.lib[i];
+                                        let txt = format!(
+                                            "{}　[{}]　基底 {}　{}",
+                                            zh_name(&e.name), e.kind, ball_name(e.base), e.holder
+                                        );
+                                        if ui.selectable_label(e.name == curname, txt).clicked() {
+                                            pick = Some(i);
+                                        }
+                                    }
+                                });
+                            if let Some(i) = pick {
+                                let p = match &self.proc { Some(p) => p, None => return };
+                                let e = &self.lib[i];
+                                match find_rec_index(p, obj, slot) {
+                                    Some(ri) => {
+                                        let ok = write_rec(p, obj, ri, &e.raw, slot);
+                                        need_pitch_reload = true;
+                                        act = Some((ok, format!("{tag} 原創「{}」", e.name)));
+                                    }
+                                    None => act = Some((false, "12 筆原創記錄都滿了".into())),
+                                }
+                            }
+                        });
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.separator();
+            }
+            ui.horizontal(|ui| {
+                if ui.button("全部球威/控球 → S").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY {
+                            cur.balls[s].power = 7;
+                            cur.balls[s].control = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "全部球種 S/S".into()));
+                }
+                if ui.button("變化量全部 → 7（直球系除外）").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY && s % 6 != 5 {
+                            cur.balls[s].move_ = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "變化量 7".into()));
+                }
+            });
+        });
+
+        // 與一般球員相同，保留原創球種記錄總覽。
+        egui::CollapsingHeader::new("原創球種 — 目前的記錄").default_open(false).show(ui, |ui| {
+            ui.label("球種陣列寫 ID36 只是旗標，名稱與效果來自這些記錄（每位選手最多 12 筆，一筆對應一個 slot）。要挑哪一顆請在上面「球種」區各格的『↳ 原創內容』選。");
+            ui.separator();
+            let mut any = false;
+            for (i, r) in cur.recs.iter().enumerate() {
+                if r.slot >= REC_UNUSED_SLOT && r.name.is_empty() {
+                    continue;
+                }
+                any = true;
+                ui.label(format!("　rec#{i}　slot{}（方向{}）　{}　[{}]　基底 {}",
+                                 r.slot, r.slot as usize % 6, zh_name(&r.name),
+                                 if r.official { "官方" } else { "自訂" },
+                                 ball_name(r.base)));
+            }
+            if !any {
+                ui.label(egui::RichText::new("（沒有原創球種記錄）").weak());
+            }
+        });
+
         egui::CollapsingHeader::new("特殊能力").default_open(true).show(ui, |ui| {
             ui.label(egui::RichText::new("等級能力").strong());
             egui::Grid::new("recruit_abil_graded").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -1974,13 +2263,31 @@ impl App {
             )).weak().small().monospace());
         });
 
+        // 原創球種記錄有變動時立刻重讀 Player Object，讓球種名稱/記錄總覽即時同步。
+        if need_pitch_reload {
+            if let Some(pl) = Player::load(P!(), obj) {
+                cur = pl;
+                manual_reload = true;
+            }
+        }
+
+        // 候選人也採用與一般球員相同的同步原則：
+        // - 修改器自己寫入時，立即更新左側 recruit_list 的 overall。
+        // - 手動「重新讀取」時，也把新快照同步到左側。
+        // - 平常絕不每幀把 recruit_cur 灌回 recruit_list；遊戲自行成長由 2 秒同步負責。
+        if act.is_some() || manual_reload {
+            if let Some(i) = self.recruit_sel {
+                if let Some(e) = self.recruit_list.get_mut(i) {
+                    if e.player.addr == cur.addr {
+                        e.player = cur.clone();
+                    }
+                }
+            }
+        }
         if let Some((ok, what)) = act {
             self.status = if ok { format!("新生招募：已寫入 {what}") } else { format!("新生招募：寫入失敗 {what}") };
         }
-        self.recruit_cur = Some(cur.clone());
-        if let Some(i) = self.recruit_sel {
-            if let Some(e) = self.recruit_list.get_mut(i) { e.player = cur; }
-        }
+        self.recruit_cur = Some(cur);
     }
 
     fn editor(&mut self, ui: &mut egui::Ui) {
@@ -3195,7 +3502,9 @@ impl App {
             }
         });
 
-        self.cur = Some(cur);
+        // cur 是右側編輯快照。不要每幀無條件灌回 self.list；
+        // 否則遊戲自然成長後，2 秒同步的新值會被舊 cur 反覆覆蓋。
+        self.cur = Some(cur.clone());
         if let Some(i) = switch {
             self.sel = Some(i);
             self.reload_current();
