@@ -1891,13 +1891,15 @@ impl eframe::App for App {
 
 impl App {
     /// 新生招募候選人只顯示/編輯已確認與一般 Player Object 共用的區域：
-    /// 主守位、投手/野手守備適性、八項能力、球速/耐力、捕手配球、特殊能力。
+    /// 主守位、投手/野手守備適性、八項能力、球速/耐力、捕手配球、球種、特殊能力。
     /// 不顯示性格/學力/年級等尚未確認能否直接沿用的欄位。
     fn recruit_editor(&mut self, ui: &mut egui::Ui) {
         let mut cur = match self.recruit_cur.clone() { Some(v) => v, None => return };
         let obj = cur.addr;
         let mut act: Option<(bool, String)> = None;
         let mut manual_reload = false;
+        // 原創球種記錄或球種 ID 改變後要從記憶體重讀，避免 cur.recs 快照過期。
+        let mut need_pitch_reload = false;
         macro_rules! P { () => { match &self.proc { Some(p) => p, None => return } }; }
 
         let (cand_index, cand_addr) = self.recruit_sel
@@ -2016,6 +2018,199 @@ impl App {
             });
         });
 
+        // ── 新生招募球種：UI 與一般球員相同。
+        // Candidate 的 obj 已經是 C+0x18 的 embedded Player Object，OFF_BALL / OFF_ORIG 可直接沿用。
+        egui::CollapsingHeader::new("球種").default_open(true).show(ui, |ui| {
+            ui.checkbox(&mut self.cross_dir,
+                        "允許跨系統（遊戲不擋，但畫面會出現「直球位置放滑球」這種怪東西）");
+            ui.separator();
+            for dir in DIR_ORDER {
+                for second in [false, true] {
+                    let slot = dir + if second { 6 } else { 0 };
+                    let tag = format!("{}・第{}顆", DIR_SERIES[dir], if second { 2 } else { 1 });
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!(
+                            "{}{}", DIR_SERIES[dir], if second { "・第2顆" } else { "・第1顆" }))
+                            .strong());
+                        ui.label(egui::RichText::new(format!("{}　slot{slot}", DIR_UI[dir]))
+                            .weak().small());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let opts: Vec<u8> = if self.cross_dir {
+                            let mut v = vec![BALL_EMPTY, BALL_ORIGINAL];
+                            v.extend(BALL_NAMES.iter().map(|e| e.0).filter(|&i| i != BALL_ORIGINAL));
+                            v
+                        } else {
+                            balls_for_dir(dir)
+                        };
+                        let mut id = cur.balls[slot].id;
+                        egui::ComboBox::from_id_source(("recruit_ball", obj, slot))
+                            .width(210.0)
+                            .selected_text(cur.ball_label(slot))
+                            .show_ui(ui, |ui| {
+                                for o in opts {
+                                    let txt = if o == BALL_ORIGINAL {
+                                        "原創球種（下面選要哪一顆）".to_string()
+                                    } else {
+                                        ball_name(o)
+                                    };
+                                    ui.selectable_value(&mut id, o, txt);
+                                }
+                            });
+                        if id != cur.balls[slot].id {
+                            let was_orig = cur.balls[slot].id == BALL_ORIGINAL;
+                            cur.balls[slot].id = id;
+                            if id != BALL_EMPTY && cur.balls[slot].power == 0 {
+                                cur.balls[slot].power = 7;
+                                cur.balls[slot].control = 7;
+                                cur.balls[slot].move_ = if dir == 5 { 0 } else { 4 };
+                            }
+                            let b = cur.balls[slot].clone();
+                            // Candidate 沒有明星選手的成長經驗值同步需求，直接寫 Player Object 球種欄位。
+                            let mut ok = write_ball(P!(), obj, slot, &b);
+                            if was_orig && id != BALL_ORIGINAL {
+                                if let Some(ri) = cur.recs.iter().position(|r| r.slot == slot as u32) {
+                                    ok &= clear_rec(P!(), obj, ri);
+                                    need_pitch_reload = true;
+                                }
+                            }
+                            act = Some((ok, format!("{tag} 球種")));
+                        }
+
+                        if cur.balls[slot].id != BALL_EMPTY {
+                            let mut changed = false;
+                            ui.label("球威");
+                            if let Some(n) = grade_btn(ui, cur.balls[slot].power, &GS_OPTS, 46.0) {
+                                cur.balls[slot].power = n;
+                                changed = true;
+                            }
+                            ui.label("控球");
+                            if let Some(n) = grade_btn(ui, cur.balls[slot].control, &GS_OPTS, 46.0) {
+                                cur.balls[slot].control = n;
+                                changed = true;
+                            }
+                            if dir != 5 {
+                                ui.label("變化量");
+                                let mut mv = cur.balls[slot].move_;
+                                if ui.add(egui::Slider::new(&mut mv, 0..=7).show_value(true)).changed() {
+                                    cur.balls[slot].move_ = mv;
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                let b = cur.balls[slot].clone();
+                                let ok = write_ball(P!(), obj, slot, &b);
+                                act = Some((ok, format!("{tag} 球威/控球/變化")));
+                            }
+                        }
+                    });
+
+                    // 原創球種的選擇方式與一般球員相同。
+                    if cur.balls[slot].id == BALL_ORIGINAL {
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            if self.lib.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(230, 170, 80),
+                                    "沒有球種庫 → 畫面只會顯示「原創」。按最上面的「⟳ 蒐集原創球種到球種庫」",
+                                );
+                                return;
+                            }
+                            let curname = cur
+                                .rec_for_slot(slot)
+                                .map(|r| r.name.clone())
+                                .unwrap_or_default();
+                            let opts: Vec<usize> = (0..self.lib.len())
+                                .filter(|&i| self.cross_dir || self.lib[i].dir == dir)
+                                .collect();
+                            let sel_txt = if curname.is_empty() {
+                                "（未設定→畫面只顯示「原創」，點這裡挑一顆）".to_string()
+                            } else {
+                                zh_name(&curname)
+                            };
+                            let mut pick: Option<usize> = None;
+                            ui.label("↳ 原創內容");
+                            egui::ComboBox::from_id_source(("recruit_orig", obj, slot))
+                                .width(330.0)
+                                .selected_text(sel_txt)
+                                .show_ui(ui, |ui| {
+                                    for i in opts {
+                                        let e = &self.lib[i];
+                                        let txt = format!(
+                                            "{}　[{}]　基底 {}　{}",
+                                            zh_name(&e.name), e.kind, ball_name(e.base), e.holder
+                                        );
+                                        if ui.selectable_label(e.name == curname, txt).clicked() {
+                                            pick = Some(i);
+                                        }
+                                    }
+                                });
+                            if let Some(i) = pick {
+                                let p = match &self.proc { Some(p) => p, None => return };
+                                let e = &self.lib[i];
+                                match find_rec_index(p, obj, slot) {
+                                    Some(ri) => {
+                                        let ok = write_rec(p, obj, ri, &e.raw, slot);
+                                        need_pitch_reload = true;
+                                        act = Some((ok, format!("{tag} 原創「{}」", e.name)));
+                                    }
+                                    None => act = Some((false, "12 筆原創記錄都滿了".into())),
+                                }
+                            }
+                        });
+                    }
+                    ui.add_space(2.0);
+                }
+                ui.separator();
+            }
+            ui.horizontal(|ui| {
+                if ui.button("全部球威/控球 → S").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY {
+                            cur.balls[s].power = 7;
+                            cur.balls[s].control = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "全部球種 S/S".into()));
+                }
+                if ui.button("變化量全部 → 7（直球系除外）").clicked() {
+                    let p = match &self.proc { Some(p) => p, None => return };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY && s % 6 != 5 {
+                            cur.balls[s].move_ = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "變化量 7".into()));
+                }
+            });
+        });
+
+        // 與一般球員相同，保留原創球種記錄總覽。
+        egui::CollapsingHeader::new("原創球種 — 目前的記錄").default_open(false).show(ui, |ui| {
+            ui.label("球種陣列寫 ID36 只是旗標，名稱與效果來自這些記錄（每位選手最多 12 筆，一筆對應一個 slot）。要挑哪一顆請在上面「球種」區各格的『↳ 原創內容』選。");
+            ui.separator();
+            let mut any = false;
+            for (i, r) in cur.recs.iter().enumerate() {
+                if r.slot >= REC_UNUSED_SLOT && r.name.is_empty() {
+                    continue;
+                }
+                any = true;
+                ui.label(format!("　rec#{i}　slot{}（方向{}）　{}　[{}]　基底 {}",
+                                 r.slot, r.slot as usize % 6, zh_name(&r.name),
+                                 if r.official { "官方" } else { "自訂" },
+                                 ball_name(r.base)));
+            }
+            if !any {
+                ui.label(egui::RichText::new("（沒有原創球種記錄）").weak());
+            }
+        });
+
         egui::CollapsingHeader::new("特殊能力").default_open(true).show(ui, |ui| {
             ui.label(egui::RichText::new("等級能力").strong());
             egui::Grid::new("recruit_abil_graded").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -2067,6 +2262,14 @@ impl App {
                 "現值 {}", cur.abil.iter().map(|b| format!("{b:02x}")).collect::<Vec<_>>().join(" ")
             )).weak().small().monospace());
         });
+
+        // 原創球種記錄有變動時立刻重讀 Player Object，讓球種名稱/記錄總覽即時同步。
+        if need_pitch_reload {
+            if let Some(pl) = Player::load(P!(), obj) {
+                cur = pl;
+                manual_reload = true;
+            }
+        }
 
         // 候選人也採用與一般球員相同的同步原則：
         // - 修改器自己寫入時，立即更新左側 recruit_list 的 overall。
