@@ -1516,102 +1516,337 @@ pub fn set_talent_rate(p: &Proc, rate: u8) -> Result<(), String> {
     Ok(())
 }
 
-// ── 新生招募成功率 100% runtime patch
-// 已實機確認：exe+0x65C6542 原始指令 `BF 63 00 00 00` (mov edi,99)。
-// 舊 CE 腳本在此跳 code cave：先 `mov esi,100`，再補回原指令。
-pub const RECRUIT_RATE_PATCH_RVA: usize = 0x65C6542;
-const RECRUIT_RATE_ORIG: [u8; 5] = [0xBF, 0x63, 0x00, 0x00, 0x00];
-static RECRUIT_RATE_CAVE: std::sync::Mutex<Option<(u32, usize)>> = std::sync::Mutex::new(None);
+// ── 新生招募成功率 100%：純資料表 patch
+//
+// 2026-09-13 重新逆向確認 FUN_1465C64A0 的實際公式：
+//   chance = base[param_2] + max(item_effect, 0) + bonus
+//   success = random(0..99) < chance
+//
+// base table  : Ghidra VA 0x14B18A3E8 → RVA 0x0B18A3E8
+// bonus table : Ghidra VA 0x14B18A400 → RVA 0x0B18A400
+//
+// 原始 base  = [0, 50, 60, 70, 80, 90]
+// 原始 bonus = [(0,+20), (100,+10), (140,0), (180,-10), (220,-20), (260,-30)]
+//
+// 100% 模式只改：
+//   base[1..=5] → 100（base[0] 的特殊語意尚未確認，因此保持 0，不碰）
+//   bonus 的 0/-10/-20/-30 → +10；原本 +20/+10 保持不變。
+// 這樣有效 tier 的 chance 最低為 100 + max(param_3,0) + 10 >= 110。
+// FUN_1465C64A0 的最高反應第一層門檻是 chance-10，因此最低也有 100，
+// 對 random(0..99) 必定成立：同時保證招募成功與最高反應，不改 executable control flow。
+pub const RECRUIT_RATE_BASE_TABLE_RVA: usize = 0x0B18_A3E8;
+pub const RECRUIT_RATE_BONUS_TABLE_RVA: usize = 0x0B18_A400;
 
-pub fn recruit_rate_100_enabled(p: &Proc) -> bool {
-    let g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
-    matches!(*g, Some((pid, _)) if pid == p.pid)
+const RECRUIT_RATE_BASE_ORIG: [i32; 6] = [0, 50, 60, 70, 80, 90];
+const RECRUIT_RATE_BONUS_ORIG: [i32; 12] = [
+    0, 20,
+    100, 10,
+    140, 0,
+    180, -10,
+    220, -20,
+    260, -30,
+];
+
+// (RVA, 原始值, 100% 模式值)。只列真正會被修改的 9 個 DWORD。
+const RECRUIT_RATE_DATA_PATCH: [(usize, i32, i32); 9] = [
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x04, 50, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x08, 60, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x0C, 70, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x10, 80, 100),
+    (RECRUIT_RATE_BASE_TABLE_RVA + 0x14, 90, 100),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x14, 0, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x1C, -10, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x24, -20, 10),
+    (RECRUIT_RATE_BONUS_TABLE_RVA + 0x2C, -30, 10),
+];
+
+// 只記錄「本次修改器 instance 實際成功套用」的 PID。
+// 不會在啟動時掃描或擅自恢復其他工具留下的資料修改。
+static RECRUIT_RATE_DATA_PATCH_PID: std::sync::Mutex<Option<u32>> =
+    std::sync::Mutex::new(None);
+
+fn read_i32_exact(p: &Proc, addr: usize) -> Option<i32> {
+    let b = p.read(addr, 4)?;
+    (b.len() == 4).then(|| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
 }
 
-/// 關閉「招募機率100%」patch。
-///
-/// 只允許還原「本次修改器 instance 自己建立、且仍有 cave 記錄」的 patch。
-/// 不會在啟動時掃到任意 JMP 就強制寫回原始 bytes，避免誤傷遊戲或其他工具的修改。
-pub fn reset_recruit_rate_patch(p: &Proc) -> Result<bool, String> {
-    let site = p.base + RECRUIT_RATE_PATCH_RVA;
-    let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
-    let cave = match *g {
-        Some((pid, cave)) if pid == p.pid => cave,
-        _ => return Ok(false),
+/// 靜態表通常位於唯讀映射；短暫開寫入權限，寫完立即恢復原 protection。
+/// 若該頁原本可執行，仍使用 PAGE_EXECUTE_READWRITE，避免短暫移除 execute 權限；
+/// 一般 .rdata 則用 PAGE_READWRITE。這是資料寫入，不配置 executable memory，也不改 JMP。
+fn write_static_i32(p: &Proc, addr: usize, value: i32) -> bool {
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READWRITE_LOCAL: u32 = 0x40;
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQueryEx(
+            p.h,
+            addr as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 {
+        return false;
+    }
+    let executable_page = matches!(mbi.Protect & 0xFF, 0x10 | 0x20 | 0x40 | 0x80);
+    let temporary = if executable_page {
+        PAGE_EXECUTE_READWRITE_LOCAL
+    } else {
+        PAGE_READWRITE
     };
 
-    if !p.write_code(site, &RECRUIT_RATE_ORIG) {
-        return Err("無法還原招募機率原始指令".into());
+    let mut old = 0u32;
+    unsafe {
+        if VirtualProtectEx(p.h, addr as *mut c_void, 4, temporary, &mut old) == 0 {
+            return false;
+        }
     }
 
-    unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+    let ok = p.write(addr, &value.to_le_bytes());
+    let mut back = 0u32;
+    unsafe {
+        VirtualProtectEx(p.h, addr as *mut c_void, 4, old, &mut back);
+    }
+    ok
+}
+
+/// 啟用前驗證完整兩張 table，避免遊戲更新後 RVA / layout 已變卻仍盲寫。
+fn verify_recruit_rate_original_tables(p: &Proc) -> Result<(), String> {
+    for (i, &want) in RECRUIT_RATE_BASE_ORIG.iter().enumerate() {
+        let addr = p.base + RECRUIT_RATE_BASE_TABLE_RVA + i * 4;
+        let got = read_i32_exact(p, addr)
+            .ok_or_else(|| format!("讀不到招募 base table index {i}"))?;
+        if got != want {
+            return Err(format!(
+                "招募 base table 驗證失敗：index {i} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+
+    for (i, &want) in RECRUIT_RATE_BONUS_ORIG.iter().enumerate() {
+        let addr = p.base + RECRUIT_RATE_BONUS_TABLE_RVA + i * 4;
+        let got = read_i32_exact(p, addr)
+            .ok_or_else(|| format!("讀不到招募 bonus table index {i}"))?;
+        if got != want {
+            return Err(format!(
+                "招募 bonus table 驗證失敗：index {i} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_recruit_rate_patch_entries(p: &Proc, patched: bool) -> Result<(), String> {
+    for &(rva, orig, patched_value) in &RECRUIT_RATE_DATA_PATCH {
+        let want = if patched { patched_value } else { orig };
+        let got = read_i32_exact(p, p.base + rva)
+            .ok_or_else(|| format!("讀不到招募機率資料表 exe+0x{rva:X}"))?;
+        if got != want {
+            return Err(format!(
+                "招募機率資料表狀態不符：exe+0x{rva:X} 目前為 {got}，預期 {want}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn recruit_rate_100_enabled(p: &Proc) -> bool {
+    let g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    matches!(*g, Some(pid) if pid == p.pid)
+        && verify_recruit_rate_patch_entries(p, true).is_ok()
+}
+
+/// 還原本次修改器 instance 自己套用的「招募機率100%」資料表 patch。
+///
+/// 安全原則：
+/// - 沒有本 instance 的 active PID 記錄 → 不動任何資料。
+/// - 還原前必須確認 9 個欄位仍是本修改器寫入的值；若被其他工具改過，拒絕覆蓋。
+/// - 若中途寫入失敗，嘗試把已還原的欄位重新套回 patched 值，避免半套狀態。
+pub fn reset_recruit_rate_patch(p: &Proc) -> Result<bool, String> {
+    let mut g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match *g {
+        Some(pid) if pid == p.pid => {}
+        _ => return Ok(false),
+    }
+
+    verify_recruit_rate_patch_entries(p, true)?;
+
+    let mut restored = 0usize;
+    for &(rva, orig, _) in &RECRUIT_RATE_DATA_PATCH {
+        if !write_static_i32(p, p.base + rva, orig) {
+            // best-effort rollback：把前面已還原的欄位重新設回 patched 值。
+            for &(rrva, _, patched_value) in RECRUIT_RATE_DATA_PATCH[..restored].iter().rev() {
+                let _ = write_static_i32(p, p.base + rrva, patched_value);
+            }
+            return Err(format!("還原招募機率資料表失敗：exe+0x{rva:X}"));
+        }
+        restored += 1;
+    }
+
+    verify_recruit_rate_patch_entries(p, false)?;
     *g = None;
     Ok(true)
 }
 
 pub fn set_recruit_rate_100(p: &Proc, enable: bool) -> Result<(), String> {
-    let site = p.base + RECRUIT_RATE_PATCH_RVA;
-
     if !enable {
         reset_recruit_rate_patch(p)?;
         return Ok(());
     }
 
-    let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = RECRUIT_RATE_DATA_PATCH_PID
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
-    if matches!(*g, Some((pid, _)) if pid == p.pid) {
-        return Ok(());
+    if let Some(pid) = *g {
+        if pid == p.pid {
+            // UI 重複要求 enable 時，不重寫；但仍確認資料沒有被外部改掉。
+            verify_recruit_rate_patch_entries(p, true)?;
+            return Ok(());
+        }
+        // 遊戲已換 PID；舊 process 的記憶體已不存在，丟掉舊 instance 記錄。
+        *g = None;
     }
-    // pid 已換：舊 process 的 cave 不再可用，直接丟掉記錄。
-    *g = None;
 
-    let cur = p.read(site, 5).ok_or("讀不到招募機率 patch 位址")?;
-    if cur.as_slice() != RECRUIT_RATE_ORIG {
-        return Err(format!("招募機率 patch 位址驗證失敗：exe+0x{:X} 不是預期指令", RECRUIT_RATE_PATCH_RVA));
+    // 啟用前驗證完整兩張原始 table，而不是只驗證要改的 8 格。
+    verify_recruit_rate_original_tables(p)?;
+
+    let mut written = 0usize;
+    for &(rva, orig, patched_value) in &RECRUIT_RATE_DATA_PATCH {
+        if !write_static_i32(p, p.base + rva, patched_value) {
+            // best-effort rollback：前面已改的欄位全部恢復原始值。
+            for &(rrva, rorig, _) in RECRUIT_RATE_DATA_PATCH[..written].iter().rev() {
+                let _ = write_static_i32(p, p.base + rrva, rorig);
+            }
+            return Err(format!("寫入招募機率資料表失敗：exe+0x{rva:X}"));
+        }
+        let _ = orig; // 保留 tuple 語意，orig 在 rollback / restore 使用。
+        written += 1;
     }
 
-    // rel32 jmp 必須在 ±2GB。優先要求 Windows 在主模組附近配置一頁。
-    let mut cave = 0usize;
-    for delta in (0x0100_0000usize..=0x7000_0000).step_by(0x0100_0000) {
-        for addr in [p.base.wrapping_add(delta), p.base.wrapping_sub(delta)] {
-            let q = unsafe {
-                VirtualAllocEx(p.h, addr as *mut c_void, 0x1000,
-                               MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)
-            } as usize;
-            if q != 0 {
-                let d = q as i128 - (site + 5) as i128;
-                if d >= i32::MIN as i128 && d <= i32::MAX as i128 {
-                    cave = q;
-                    break;
+    if let Err(e) = verify_recruit_rate_patch_entries(p, true) {
+        // 驗證失敗也回滾，避免留下部分或未知狀態。
+        for &(rva, orig, _) in RECRUIT_RATE_DATA_PATCH.iter().rev() {
+            let _ = write_static_i32(p, p.base + rva, orig);
+        }
+        return Err(e);
+    }
+
+    *g = Some(p.pid);
+    Ok(())
+}
+
+// ─────────────────────────────────────────────── LEGACY / DISABLED
+// 舊的 code-cave 方案保留作為研究與相容性備案，但目前完全不參與 UI / lifecycle。
+// 如未來真的需要重新啟用，先移除 `#[cfg(any())]`，並重新審核該版本遊戲的指令與 xref。
+// 舊方案：exe+0x65C6542 的 `mov edi,99` → JMP cave → mov esi,100 → mov edi,99 → jump back。
+#[cfg(any())]
+mod legacy_recruit_rate_code_cave {
+    use super::*;
+
+    pub const RECRUIT_RATE_PATCH_RVA: usize = 0x65C6542;
+    const RECRUIT_RATE_ORIG: [u8; 5] = [0xBF, 0x63, 0x00, 0x00, 0x00];
+    static RECRUIT_RATE_CAVE: std::sync::Mutex<Option<(u32, usize)>> =
+        std::sync::Mutex::new(None);
+
+    pub fn recruit_rate_100_enabled_legacy(p: &Proc) -> bool {
+        let g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        matches!(*g, Some((pid, _)) if pid == p.pid)
+    }
+
+    pub fn reset_recruit_rate_patch_legacy(p: &Proc) -> Result<bool, String> {
+        let site = p.base + RECRUIT_RATE_PATCH_RVA;
+        let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        let cave = match *g {
+            Some((pid, cave)) if pid == p.pid => cave,
+            _ => return Ok(false),
+        };
+
+        if !p.write_code(site, &RECRUIT_RATE_ORIG) {
+            return Err("無法還原招募機率原始指令".into());
+        }
+        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+        *g = None;
+        Ok(true)
+    }
+
+    pub fn set_recruit_rate_100_legacy(p: &Proc, enable: bool) -> Result<(), String> {
+        let site = p.base + RECRUIT_RATE_PATCH_RVA;
+        if !enable {
+            reset_recruit_rate_patch_legacy(p)?;
+            return Ok(());
+        }
+
+        let mut g = RECRUIT_RATE_CAVE.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(*g, Some((pid, _)) if pid == p.pid) {
+            return Ok(());
+        }
+        *g = None;
+
+        let cur = p.read(site, 5).ok_or("讀不到招募機率 patch 位址")?;
+        if cur.as_slice() != RECRUIT_RATE_ORIG {
+            return Err(format!(
+                "招募機率 patch 位址驗證失敗：exe+0x{:X} 不是預期指令",
+                RECRUIT_RATE_PATCH_RVA
+            ));
+        }
+
+        let mut cave = 0usize;
+        for delta in (0x0100_0000usize..=0x7000_0000).step_by(0x0100_0000) {
+            for addr in [p.base.wrapping_add(delta), p.base.wrapping_sub(delta)] {
+                let q = unsafe {
+                    VirtualAllocEx(
+                        p.h,
+                        addr as *mut c_void,
+                        0x1000,
+                        MEM_COMMIT | MEM_RESERVE,
+                        PAGE_EXECUTE_READWRITE,
+                    )
+                } as usize;
+                if q != 0 {
+                    let d = q as i128 - (site + 5) as i128;
+                    if d >= i32::MIN as i128 && d <= i32::MAX as i128 {
+                        cave = q;
+                        break;
+                    }
+                    unsafe { VirtualFreeEx(p.h, q as *mut c_void, 0, MEM_RELEASE); }
                 }
-                unsafe { VirtualFreeEx(p.h, q as *mut c_void, 0, MEM_RELEASE); }
+            }
+            if cave != 0 {
+                break;
             }
         }
-        if cave != 0 { break; }
-    }
-    if cave == 0 { return Err("無法在招募機率程式碼附近配置 code cave".into()); }
+        if cave == 0 {
+            return Err("無法在招募機率程式碼附近配置 code cave".into());
+        }
 
-    // cave: mov esi,100 ; mov edi,99 ; jmp site+5
-    let mut code = vec![0xBE,0x64,0,0,0, 0xBF,0x63,0,0,0, 0xE9,0,0,0,0];
-    let back = (site + 5) as i128 - (cave + code.len()) as i128;
-    if back < i32::MIN as i128 || back > i32::MAX as i128 {
-        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
-        return Err("code cave 回跳距離超出 rel32".into());
+        let mut code = vec![0xBE, 0x64, 0, 0, 0, 0xBF, 0x63, 0, 0, 0, 0xE9, 0, 0, 0, 0];
+        let back = (site + 5) as i128 - (cave + code.len()) as i128;
+        if back < i32::MIN as i128 || back > i32::MAX as i128 {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("code cave 回跳距離超出 rel32".into());
+        }
+        code[11..15].copy_from_slice(&(back as i32).to_le_bytes());
+        if !p.write(cave, &code) {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("無法寫入招募機率 code cave".into());
+        }
+
+        let rel = cave as i128 - (site + 5) as i128;
+        let mut jmp = [0xE9, 0, 0, 0, 0];
+        jmp[1..5].copy_from_slice(&(rel as i32).to_le_bytes());
+        if !p.write_code(site, &jmp) {
+            unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
+            return Err("無法啟用招募機率 patch".into());
+        }
+        *g = Some((p.pid, cave));
+        Ok(())
     }
-    code[11..15].copy_from_slice(&(back as i32).to_le_bytes());
-    if !p.write(cave, &code) {
-        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
-        return Err("無法寫入招募機率 code cave".into());
-    }
-    let rel = cave as i128 - (site + 5) as i128;
-    let mut jmp = [0xE9,0,0,0,0];
-    jmp[1..5].copy_from_slice(&(rel as i32).to_le_bytes());
-    if !p.write_code(site, &jmp) {
-        unsafe { VirtualFreeEx(p.h, cave as *mut c_void, 0, MEM_RELEASE); }
-        return Err("無法啟用招募機率 patch".into());
-    }
-    *g = Some((p.pid, cave));
-    Ok(())
 }
 
 /// 栄冠模式的部員名單。離開該模式時回傳空 Vec 屬正常。
