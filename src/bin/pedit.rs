@@ -254,6 +254,18 @@ struct App {
     talent_rate: u8,
     /// 招募成功率 100% patch 的 UI 狀態。
     recruit_rate_100: bool,
+    /// 地區轉生自訂機率。若 rate_is_original=true，實際記憶體是原始 10/12/14/16/18/20 階梯。
+    region_reincarnation_rate: u8,
+    /// 地區轉生自訂最大人數（六 tier 共用）。
+    region_reincarnation_max: u8,
+    /// 地區轉生整組目前是否完全等於遊戲原始設定。
+    region_reincarnation_original: bool,
+    /// 地區轉生機率欄目前是否仍是原始六階梯（即使最大人數已自訂也保留此資訊）。
+    region_reincarnation_rate_original: bool,
+    /// 新生入學轉生機率。
+    freshman_reincarnation_rate: u8,
+    /// 新生入學轉生最大人數。
+    freshman_reincarnation_max: u8,
     /// 上一次已讀取的 Region；即使結果是空的也不會每幀重掃。
     recruit_loaded_region: Option<usize>,
     /// 新生招募：目前地區的候選人（保留原始 candidate index 0..9）。
@@ -341,6 +353,14 @@ impl App {
             Err(e) => (None, e),
         };
         let initial_talent_rate = proc.as_ref().and_then(talent_rate).unwrap_or(TALENT_RATE_DEFAULT);
+        let initial_region = proc.as_ref().and_then(|p| region_reincarnation_settings(p).ok());
+        let initial_region_rate = initial_region.as_ref().and_then(|s| s.uniform_rate()).unwrap_or(10);
+        let initial_region_max = initial_region.as_ref().and_then(|s| s.uniform_max()).unwrap_or(2);
+        let initial_region_original = initial_region.as_ref().is_some_and(|s| s.is_original());
+        let initial_region_rate_original = initial_region.as_ref().is_some_and(|s| s.rate_is_original());
+        let (initial_freshman_rate, initial_freshman_max) = proc.as_ref()
+            .and_then(|p| freshman_reincarnation_settings(p).ok())
+            .unwrap_or((FRESHMAN_REINCARNATION_RATE_DEFAULT, FRESHMAN_REINCARNATION_MAX_DEFAULT));
         let mut app = App {
             proc,
             err,
@@ -350,6 +370,12 @@ impl App {
             recruit_regions: Vec::new(),
             talent_rate: initial_talent_rate,
             recruit_rate_100: false,
+            region_reincarnation_rate: initial_region_rate,
+            region_reincarnation_max: initial_region_max,
+            region_reincarnation_original: initial_region_original,
+            region_reincarnation_rate_original: initial_region_rate_original,
+            freshman_reincarnation_rate: initial_freshman_rate,
+            freshman_reincarnation_max: initial_freshman_max,
             recruit_loaded_region: None,
             recruit_list: Vec::new(),
             recruit_sel: None,
@@ -428,6 +454,30 @@ impl App {
                 self.status = attach_msg;
                 self.recruit_rate_100 = false;
                 self.talent_rate = talent_rate(&p).unwrap_or(TALENT_RATE_DEFAULT);
+                match region_reincarnation_settings(&p) {
+                    Ok(s) => {
+                        self.region_reincarnation_rate = s.uniform_rate().unwrap_or(10);
+                        self.region_reincarnation_max = s.uniform_max().unwrap_or(2);
+                        self.region_reincarnation_original = s.is_original();
+                        self.region_reincarnation_rate_original = s.rate_is_original();
+                    }
+                    Err(_) => {
+                        self.region_reincarnation_rate = 10;
+                        self.region_reincarnation_max = 2;
+                        self.region_reincarnation_original = false;
+                        self.region_reincarnation_rate_original = false;
+                    }
+                }
+                match freshman_reincarnation_settings(&p) {
+                    Ok((rate, max)) => {
+                        self.freshman_reincarnation_rate = rate;
+                        self.freshman_reincarnation_max = max;
+                    }
+                    Err(_) => {
+                        self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
+                        self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
+                    }
+                }
                 self.proc = Some(p);
                 self.err.clear();
                 true
@@ -1647,6 +1697,153 @@ impl eframe::App for App {
                         }
                     }
                 });
+
+                ui.add_space(4.0);
+                ui.separator();
+                ui.label(egui::RichText::new("地區轉生球員(以地區的轉生名單為主)").strong());
+                ui.horizontal(|ui| {
+                    ui.label("轉生出現機率");
+                    let mut v = self.region_reincarnation_rate.min(100);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 0..=100).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(0..=100).speed(1.0))
+                        .changed();
+                    ui.label("%");
+                    if slider_changed || input_changed {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_region_reincarnation_rate(p, v) {
+                                Ok(()) => {
+                                    self.region_reincarnation_rate = v;
+                                    self.region_reincarnation_rate_original = false;
+                                    self.region_reincarnation_original = false;
+                                    self.status = format!("地區轉生出現機率 → {v}%（六 tier 統一）");
+                                }
+                                Err(e) => self.status = format!("地區轉生機率修改失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改地區轉生機率".into();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("轉生最大人數");
+                    let mut v = self.region_reincarnation_max.clamp(1, 10);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 1..=10).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(1..=10).speed(1.0))
+                        .changed();
+                    ui.label("人");
+                    if slider_changed || input_changed {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_region_reincarnation_max(p, v) {
+                                Ok(()) => {
+                                    self.region_reincarnation_max = v;
+                                    self.region_reincarnation_original = false;
+                                    self.status = format!("地區轉生最大人數 → {v} 人（六 tier 統一）");
+                                }
+                                Err(e) => self.status = format!("地區轉生最大人數修改失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改地區轉生最大人數".into();
+                        }
+                    }
+                    if ui.button("恢復原始設定").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match reset_region_reincarnation(p) {
+                                Ok(()) => {
+                                    self.region_reincarnation_rate = 10;
+                                    self.region_reincarnation_max = 2;
+                                    self.region_reincarnation_original = true;
+                                    self.region_reincarnation_rate_original = true;
+                                    self.status = "地區轉生已恢復遊戲原始設定：10/12/14/16/18/20%，最大 2 人".into();
+                                }
+                                Err(e) => self.status = format!("地區轉生恢復失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法恢復地區轉生設定".into();
+                        }
+                    }
+                });
+                if self.region_reincarnation_rate_original {
+                    if self.region_reincarnation_original {
+                        ui.weak("目前：遊戲原始設定（10～20% / 最大2人）");
+                    } else {
+                        ui.weak(format!("目前：機率為遊戲原始六階梯 10～20% / 最大{}人", self.region_reincarnation_max));
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("新生轉生入學").strong());
+                ui.horizontal(|ui| {
+                    ui.label("轉生出現機率");
+                    let mut v = self.freshman_reincarnation_rate.min(100);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 0..=100).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(0..=100).speed(1.0))
+                        .changed();
+                    ui.label("%");
+                    if slider_changed || input_changed {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_freshman_reincarnation_rate(p, v) {
+                                Ok(()) => {
+                                    self.freshman_reincarnation_rate = v;
+                                    self.status = format!("新生轉生出現機率 → {v}%");
+                                }
+                                Err(e) => self.status = format!("新生轉生機率修改失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改新生轉生機率".into();
+                        }
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("轉生最大人數");
+                    let mut v = self.freshman_reincarnation_max.clamp(1, 10);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 1..=10).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(1..=10).speed(1.0))
+                        .changed();
+                    ui.label("人");
+                    if slider_changed || input_changed {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_freshman_reincarnation_max(p, v) {
+                                Ok(()) => {
+                                    self.freshman_reincarnation_max = v;
+                                    self.status = format!("新生轉生最大人數 → {v} 人");
+                                }
+                                Err(e) => self.status = format!("新生轉生最大人數修改失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改新生轉生最大人數".into();
+                        }
+                    }
+                    if ui.button("恢復原始設定").clicked() {
+                        if let Some(p) = self.proc.as_ref() {
+                            match reset_freshman_reincarnation(p) {
+                                Ok(()) => {
+                                    self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
+                                    self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
+                                    self.status = format!(
+                                        "新生轉生已恢復原始設定：{}% / {}人",
+                                        FRESHMAN_REINCARNATION_RATE_DEFAULT,
+                                        FRESHMAN_REINCARNATION_MAX_DEFAULT
+                                    );
+                                }
+                                Err(e) => self.status = format!("新生轉生恢復失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法恢復新生轉生設定".into();
+                        }
+                    }
+                });
                 ui.separator();
             }
 
@@ -1932,6 +2129,8 @@ impl App {
         let obj = cur.addr;
         let mut act: Option<(bool, String)> = None;
         let mut manual_reload = false;
+        // 球種 ID／原創球種記錄變動後要從記憶體重新讀取，避免本地快照落後。
+        let mut need_reload = false;
         macro_rules! P { () => { match &self.proc { Some(p) => p, None => return } }; }
 
         let (cand_index, cand_addr) = self.recruit_sel
@@ -2050,6 +2249,239 @@ impl App {
             });
         });
 
+        // ── 球種：Candidate +0x18 就是完整 Player Object，直接沿用一般球員的球種欄位。
+        egui::CollapsingHeader::new("球種").default_open(true).show(ui, |ui| {
+            ui.checkbox(
+                &mut self.cross_dir,
+                "允許跨系統（遊戲不擋，但畫面可能出現不自然的球種配置）",
+            );
+            ui.separator();
+
+            for dir in DIR_ORDER {
+                for second in [false, true] {
+                    let slot = dir + if second { 6 } else { 0 };
+                    let tag = format!(
+                        "{}・第{}顆",
+                        DIR_SERIES[dir],
+                        if second { 2 } else { 1 }
+                    );
+
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{}{}",
+                                DIR_SERIES[dir],
+                                if second { "・第2顆" } else { "・第1顆" }
+                            ))
+                            .strong(),
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("{}　slot{slot}", DIR_UI[dir]))
+                                .weak()
+                                .small(),
+                        );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(12.0);
+                        let opts: Vec<u8> = if self.cross_dir {
+                            let mut v = vec![BALL_EMPTY, BALL_ORIGINAL];
+                            v.extend(
+                                BALL_NAMES
+                                    .iter()
+                                    .map(|e| e.0)
+                                    .filter(|&i| i != BALL_ORIGINAL),
+                            );
+                            v
+                        } else {
+                            balls_for_dir(dir)
+                        };
+
+                        let mut id = cur.balls[slot].id;
+                        egui::ComboBox::from_id_source(("recruit_ball", obj, slot))
+                            .width(210.0)
+                            .selected_text(cur.ball_label(slot))
+                            .show_ui(ui, |ui| {
+                                for o in opts {
+                                    let txt = if o == BALL_ORIGINAL {
+                                        "原創球種（下面選要哪一顆）".to_string()
+                                    } else {
+                                        ball_name(o)
+                                    };
+                                    ui.selectable_value(&mut id, o, txt);
+                                }
+                            });
+
+                        if id != cur.balls[slot].id {
+                            let was_orig = cur.balls[slot].id == BALL_ORIGINAL;
+                            cur.balls[slot].id = id;
+                            if id != BALL_EMPTY && cur.balls[slot].power == 0 {
+                                cur.balls[slot].power = 7;
+                                cur.balls[slot].control = 7;
+                                cur.balls[slot].move_ = if dir == 5 { 0 } else { 4 };
+                            }
+                            let b = cur.balls[slot].clone();
+                            let mut ok = write_ball(P!(), obj, slot, &b);
+                            if was_orig && id != BALL_ORIGINAL {
+                                if let Some(ri) = cur
+                                    .recs
+                                    .iter()
+                                    .position(|r| r.slot == slot as u32)
+                                {
+                                    ok &= clear_rec(P!(), obj, ri);
+                                }
+                            }
+                            need_reload = true;
+                            act = Some((ok, format!("{tag} 球種")));
+                        }
+
+                        if cur.balls[slot].id != BALL_EMPTY {
+                            let mut changed = false;
+                            ui.label("球威");
+                            if let Some(n) = grade_btn(
+                                ui,
+                                cur.balls[slot].power,
+                                &GS_OPTS,
+                                46.0,
+                            ) {
+                                cur.balls[slot].power = n;
+                                changed = true;
+                            }
+                            ui.label("控球");
+                            if let Some(n) = grade_btn(
+                                ui,
+                                cur.balls[slot].control,
+                                &GS_OPTS,
+                                46.0,
+                            ) {
+                                cur.balls[slot].control = n;
+                                changed = true;
+                            }
+                            if dir != 5 {
+                                ui.label("變化量");
+                                let mut mv = cur.balls[slot].move_;
+                                if ui
+                                    .add(egui::Slider::new(&mut mv, 0..=7).show_value(true))
+                                    .changed()
+                                {
+                                    cur.balls[slot].move_ = mv;
+                                    changed = true;
+                                }
+                            }
+                            if changed {
+                                let b = cur.balls[slot].clone();
+                                let ok = write_ball(P!(), obj, slot, &b);
+                                act = Some((ok, format!("{tag} 球威/控球/變化")));
+                            }
+                        }
+                    });
+
+                    // 原創球種與一般選手相同：ID36 只是旗標，名稱／效果來自 rec 記錄。
+                    if cur.balls[slot].id == BALL_ORIGINAL {
+                        ui.horizontal(|ui| {
+                            ui.add_space(28.0);
+                            if self.lib.is_empty() {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(230, 170, 80),
+                                    "沒有球種庫 → 畫面只會顯示「原創」。請先用上方按鈕蒐集球種庫",
+                                );
+                                return;
+                            }
+
+                            let curname = cur
+                                .rec_for_slot(slot)
+                                .map(|r| r.name.clone())
+                                .unwrap_or_default();
+                            let opts: Vec<usize> = (0..self.lib.len())
+                                .filter(|&i| self.cross_dir || self.lib[i].dir == dir)
+                                .collect();
+                            let sel_txt = if curname.is_empty() {
+                                "（未設定→點這裡挑一顆）".to_string()
+                            } else {
+                                zh_name(&curname)
+                            };
+                            let mut pick: Option<usize> = None;
+                            ui.label("↳ 原創內容");
+                            egui::ComboBox::from_id_source(("recruit_orig", obj, slot))
+                                .width(330.0)
+                                .selected_text(sel_txt)
+                                .show_ui(ui, |ui| {
+                                    for i in opts {
+                                        let e = &self.lib[i];
+                                        let txt = format!(
+                                            "{}　[{}]　基底 {}　{}",
+                                            zh_name(&e.name),
+                                            e.kind,
+                                            ball_name(e.base),
+                                            e.holder
+                                        );
+                                        if ui.selectable_label(e.name == curname, txt).clicked() {
+                                            pick = Some(i);
+                                        }
+                                    }
+                                });
+
+                            if let Some(i) = pick {
+                                let p = match &self.proc {
+                                    Some(p) => p,
+                                    None => return,
+                                };
+                                let e = &self.lib[i];
+                                match find_rec_index(p, obj, slot) {
+                                    Some(ri) => {
+                                        let ok = write_rec(p, obj, ri, &e.raw, slot);
+                                        need_reload = true;
+                                        act = Some((
+                                            ok,
+                                            format!("{tag} 原創「{}」", e.name),
+                                        ));
+                                    }
+                                    None => {
+                                        act = Some((false, "12 筆原創記錄都滿了".into()));
+                                    }
+                                }
+                            }
+                        });
+                    }
+
+                    ui.add_space(2.0);
+                }
+                ui.separator();
+            }
+
+            ui.horizontal(|ui| {
+                if ui.button("全部球威/控球 → S").clicked() {
+                    let p = match &self.proc {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY {
+                            cur.balls[s].power = 7;
+                            cur.balls[s].control = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "全部球種 S/S".into()));
+                }
+                if ui.button("變化量全部 → 7（直球系除外）").clicked() {
+                    let p = match &self.proc {
+                        Some(p) => p,
+                        None => return,
+                    };
+                    let mut ok = true;
+                    for s in 0..N_BALL {
+                        if cur.balls[s].id != BALL_EMPTY && s % 6 != 5 {
+                            cur.balls[s].move_ = 7;
+                            ok &= write_ball(p, obj, s, &cur.balls[s].clone());
+                        }
+                    }
+                    act = Some((ok, "變化量 7".into()));
+                }
+            });
+        });
+
         egui::CollapsingHeader::new("特殊能力").default_open(true).show(ui, |ui| {
             ui.label(egui::RichText::new("等級能力").strong());
             egui::Grid::new("recruit_abil_graded").num_columns(3).spacing([10.0, 4.0]).show(ui, |ui| {
@@ -2106,6 +2538,14 @@ impl App {
         // - 修改器自己寫入時，立即更新左側 recruit_list 的 overall。
         // - 手動「重新讀取」時，也把新快照同步到左側。
         // - 平常絕不每幀把 recruit_cur 灌回 recruit_list；遊戲自行成長由 2 秒同步負責。
+        // 原創球種記錄或球種 ID 變更後，重新讀完整 Player Object，避免 recs / ball label 快照落後。
+        if need_reload {
+            if let Some(fresh) = self.proc.as_ref().and_then(|p| Player::load(p, obj)) {
+                cur = fresh;
+                manual_reload = true;
+            }
+        }
+
         if act.is_some() || manual_reload {
             if let Some(i) = self.recruit_sel {
                 if let Some(e) = self.recruit_list.get_mut(i) {
@@ -2116,7 +2556,11 @@ impl App {
             }
         }
         if let Some((ok, what)) = act {
-            self.status = if ok { format!("新生招募：已寫入 {what}") } else { format!("新生招募：寫入失敗 {what}") };
+            self.status = if ok {
+                format!("新生招募：已寫入 {what}")
+            } else {
+                format!("新生招募：寫入失敗 {what}")
+            };
         }
         self.recruit_cur = Some(cur);
     }
@@ -3362,6 +3806,8 @@ impl App {
 // 正常關閉修改器時：
 // 1. 若本次 UI 仍勾選「招募機率100%」，自動取消並還原兩張招募機率資料表。
 // 2. 若遊戲 process 仍存活，將天才出現機率恢復為遊戲原生 1%。
+// 3. 地區轉生恢復為遊戲原始六階梯：10/12/14/16/18/20%，最大 2 人。
+// 4. 新生轉生恢復為遊戲原始設定：10%，最大 3 人。
 // 不做任何啟動時或無條件的招募機率資料 reset；lib 端只還原本 instance 成功套用且仍符合 patched 值的欄位。
 impl Drop for App {
     fn drop(&mut self) {
@@ -3370,9 +3816,17 @@ impl Drop for App {
                 let _ = set_recruit_rate_100(p, false);
             }
             let _ = set_talent_rate(p, TALENT_RATE_DEFAULT);
+            let _ = reset_region_reincarnation(p);
+            let _ = reset_freshman_reincarnation(p);
         }
         self.recruit_rate_100 = false;
         self.talent_rate = TALENT_RATE_DEFAULT;
+        self.region_reincarnation_rate = 10;
+        self.region_reincarnation_max = 2;
+        self.region_reincarnation_original = true;
+        self.region_reincarnation_rate_original = true;
+        self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
+        self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
     }
 }
 

@@ -1516,6 +1516,246 @@ pub fn set_talent_rate(p: &Proc, rate: u8) -> Result<(), String> {
     Ok(())
 }
 
+// ── 轉生球員生成控制
+//
+// Mode 1（地區轉生）：exe+0xB18A440 起每 3 bytes 一組，+1=機率、+2=最大人數，共 6 組。
+// 原始值依來源池數量為 10/12/14/16/18/20%，最大人數皆為 2。
+// Mode 0（新生轉生）：exe+0xB1145BE = 機率；exe+0x637BD98 = `83 F8 xx`，imm8 是最大人數。
+pub const REGION_REINCARNATION_TABLE_RVA: usize = 0x0B18_A440;
+pub const REGION_REINCARNATION_RATE_RVAS: [usize; 6] = [
+    0x0B18_A441, 0x0B18_A444, 0x0B18_A447,
+    0x0B18_A44A, 0x0B18_A44D, 0x0B18_A450,
+];
+pub const REGION_REINCARNATION_MAX_RVAS: [usize; 6] = [
+    0x0B18_A442, 0x0B18_A445, 0x0B18_A448,
+    0x0B18_A44B, 0x0B18_A44E, 0x0B18_A451,
+];
+pub const REGION_REINCARNATION_RATE_ORIG: [u8; 6] = [10, 12, 14, 16, 18, 20];
+pub const REGION_REINCARNATION_MAX_ORIG: [u8; 6] = [2; 6];
+
+pub const FRESHMAN_REINCARNATION_RATE_RVA: usize = 0x0B11_45BE;
+pub const FRESHMAN_REINCARNATION_MAX_CMP_RVA: usize = 0x0637_BD98;
+pub const FRESHMAN_REINCARNATION_RATE_DEFAULT: u8 = 10;
+pub const FRESHMAN_REINCARNATION_MAX_DEFAULT: u8 = 3;
+
+#[derive(Clone, Debug)]
+pub struct RegionReincarnationSettings {
+    pub rates: [u8; 6],
+    pub maxes: [u8; 6],
+}
+
+impl RegionReincarnationSettings {
+    pub fn rate_is_original(&self) -> bool {
+        self.rates == REGION_REINCARNATION_RATE_ORIG
+    }
+    pub fn uniform_rate(&self) -> Option<u8> {
+        let first = self.rates[0];
+        self.rates.iter().all(|&v| v == first).then_some(first)
+    }
+    pub fn uniform_max(&self) -> Option<u8> {
+        let first = self.maxes[0];
+        self.maxes.iter().all(|&v| v == first).then_some(first)
+    }
+    pub fn is_original(&self) -> bool {
+        self.rate_is_original() && self.maxes == REGION_REINCARNATION_MAX_ORIG
+    }
+}
+
+fn write_static_u8(p: &Proc, addr: usize, value: u8) -> bool {
+    const PAGE_READWRITE: u32 = 0x04;
+    const PAGE_EXECUTE_READWRITE_LOCAL: u32 = 0x40;
+
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let queried = unsafe {
+        VirtualQueryEx(
+            p.h,
+            addr as *const c_void,
+            &mut mbi,
+            std::mem::size_of::<MEMORY_BASIC_INFORMATION>(),
+        )
+    };
+    if queried == 0 {
+        return false;
+    }
+    let executable_page = matches!(mbi.Protect & 0xFF, 0x10 | 0x20 | 0x40 | 0x80);
+    let temporary = if executable_page { PAGE_EXECUTE_READWRITE_LOCAL } else { PAGE_READWRITE };
+    let mut old = 0u32;
+    unsafe {
+        if VirtualProtectEx(p.h, addr as *mut c_void, 1, temporary, &mut old) == 0 {
+            return false;
+        }
+    }
+    let ok = p.write(addr, &[value]);
+    let mut back = 0u32;
+    unsafe { VirtualProtectEx(p.h, addr as *mut c_void, 1, old, &mut back); }
+    ok
+}
+
+pub fn region_reincarnation_settings(p: &Proc) -> Result<RegionReincarnationSettings, String> {
+    if p.base == 0 {
+        return Err("遊戲模組基址無效".into());
+    }
+    let mut rates = [0u8; 6];
+    let mut maxes = [0u8; 6];
+    for i in 0..6 {
+        rates[i] = p.read(p.base + REGION_REINCARNATION_RATE_RVAS[i], 1)
+            .and_then(|b| b.first().copied())
+            .ok_or_else(|| format!("讀不到地區轉生機率 tier {i}"))?;
+        maxes[i] = p.read(p.base + REGION_REINCARNATION_MAX_RVAS[i], 1)
+            .and_then(|b| b.first().copied())
+            .ok_or_else(|| format!("讀不到地區轉生最大人數 tier {i}"))?;
+    }
+    if rates.iter().any(|&v| v > 100) {
+        return Err(format!("地區轉生資料表機率值異常：{:?}", rates));
+    }
+    if maxes.iter().any(|&v| !(1..=10).contains(&v)) {
+        return Err(format!("地區轉生資料表最大人數值異常：{:?}", maxes));
+    }
+    let s = RegionReincarnationSettings { rates, maxes };
+    // 目前已確認的合法 layout：機率是遊戲原始六階梯，或六 tier 已被本功能統一；
+    // 最大人數則六 tier 必須一致。其他形態視為版本/layout 不符，拒絕後續寫入。
+    if !s.rate_is_original() && s.uniform_rate().is_none() {
+        return Err(format!("地區轉生資料表格式不符：機率={:?}", s.rates));
+    }
+    if s.uniform_max().is_none() {
+        return Err(format!("地區轉生資料表格式不符：最大人數={:?}", s.maxes));
+    }
+    Ok(s)
+}
+
+fn write_region_reincarnation_column(
+    p: &Proc,
+    rvas: &[usize; 6],
+    values: [u8; 6],
+    what: &str,
+) -> Result<(), String> {
+    // 寫入前先驗證完整表，避免版本更新後對未知 layout 動手。
+    let before = region_reincarnation_settings(p)?;
+    let old: [u8; 6] = if rvas == &REGION_REINCARNATION_RATE_RVAS { before.rates } else { before.maxes };
+    let mut written = 0usize;
+    for i in 0..6 {
+        if !write_static_u8(p, p.base + rvas[i], values[i]) {
+            for j in (0..written).rev() {
+                let _ = write_static_u8(p, p.base + rvas[j], old[j]);
+            }
+            return Err(format!("寫入{what}失敗：tier {i} / exe+0x{:X}", rvas[i]));
+        }
+        written += 1;
+    }
+    // 寫完逐格確認；失敗就盡量回滾原值。
+    for i in 0..6 {
+        let got = p.read(p.base + rvas[i], 1).and_then(|b| b.first().copied());
+        if got != Some(values[i]) {
+            for j in (0..6).rev() {
+                let _ = write_static_u8(p, p.base + rvas[j], old[j]);
+            }
+            return Err(format!("{what}寫入後驗證失敗：tier {i}"));
+        }
+    }
+    Ok(())
+}
+
+pub fn set_region_reincarnation_rate(p: &Proc, rate: u8) -> Result<(), String> {
+    if rate > 100 {
+        return Err("地區轉生出現機率必須介於 0～100".into());
+    }
+    write_region_reincarnation_column(p, &REGION_REINCARNATION_RATE_RVAS, [rate; 6], "地區轉生機率")
+}
+
+pub fn set_region_reincarnation_max(p: &Proc, max: u8) -> Result<(), String> {
+    if !(1..=10).contains(&max) {
+        return Err("地區轉生最大人數必須介於 1～10".into());
+    }
+    write_region_reincarnation_column(p, &REGION_REINCARNATION_MAX_RVAS, [max; 6], "地區轉生最大人數")
+}
+
+pub fn reset_region_reincarnation(p: &Proc) -> Result<(), String> {
+    // 兩欄各自具備 rollback；若第二欄失敗，再把第一欄恢復成 reset 前狀態。
+    let before = region_reincarnation_settings(p)?;
+    write_region_reincarnation_column(p, &REGION_REINCARNATION_RATE_RVAS, REGION_REINCARNATION_RATE_ORIG, "地區轉生機率")?;
+    if let Err(e) = write_region_reincarnation_column(p, &REGION_REINCARNATION_MAX_RVAS, REGION_REINCARNATION_MAX_ORIG, "地區轉生最大人數") {
+        let _ = write_region_reincarnation_column(p, &REGION_REINCARNATION_RATE_RVAS, before.rates, "地區轉生機率 rollback");
+        return Err(e);
+    }
+    let after = region_reincarnation_settings(p)?;
+    if !after.is_original() {
+        return Err("地區轉生恢復後驗證失敗".into());
+    }
+    Ok(())
+}
+
+pub fn freshman_reincarnation_settings(p: &Proc) -> Result<(u8, u8), String> {
+    if p.base == 0 {
+        return Err("遊戲模組基址無效".into());
+    }
+    let rate = p.read(p.base + FRESHMAN_REINCARNATION_RATE_RVA, 1)
+        .and_then(|b| b.first().copied())
+        .ok_or("讀不到新生轉生機率")?;
+    if rate > 100 {
+        return Err(format!("新生轉生機率目前值異常：{rate}"));
+    }
+    let site = p.base + FRESHMAN_REINCARNATION_MAX_CMP_RVA;
+    let cur = p.read(site, 3).ok_or("讀不到新生轉生最大人數指令")?;
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+        return Err(format!(
+            "遊戲版本可能已更新，找不到預期的 CMP EAX, imm8（exe+0x{:X}）",
+            FRESHMAN_REINCARNATION_MAX_CMP_RVA
+        ));
+    }
+    if !(1..=10).contains(&cur[2]) {
+        return Err(format!("新生轉生最大人數目前值異常：{}", cur[2]));
+    }
+    Ok((rate, cur[2]))
+}
+
+pub fn set_freshman_reincarnation_rate(p: &Proc, rate: u8) -> Result<(), String> {
+    if rate > 100 {
+        return Err("新生轉生出現機率必須介於 0～100".into());
+    }
+    let (old, _) = freshman_reincarnation_settings(p)?;
+    if !write_static_u8(p, p.base + FRESHMAN_REINCARNATION_RATE_RVA, rate) {
+        return Err("無法寫入新生轉生出現機率".into());
+    }
+    let got = p.read(p.base + FRESHMAN_REINCARNATION_RATE_RVA, 1).and_then(|b| b.first().copied());
+    if got != Some(rate) {
+        let _ = write_static_u8(p, p.base + FRESHMAN_REINCARNATION_RATE_RVA, old);
+        return Err("新生轉生出現機率寫入後驗證失敗".into());
+    }
+    Ok(())
+}
+
+pub fn set_freshman_reincarnation_max(p: &Proc, max: u8) -> Result<(), String> {
+    if !(1..=10).contains(&max) {
+        return Err("新生轉生最大人數必須介於 1～10".into());
+    }
+    let (_, old) = freshman_reincarnation_settings(p)?;
+    let site = p.base + FRESHMAN_REINCARNATION_MAX_CMP_RVA;
+    let cur = p.read(site, 3).ok_or("讀不到新生轉生最大人數指令")?;
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+        return Err("新生轉生最大人數修改失敗：遊戲版本可能已更新，找不到預期的 CMP EAX, imm8".into());
+    }
+    if !p.write_code(site + 2, &[max]) {
+        return Err("無法寫入新生轉生最大人數".into());
+    }
+    let verify = p.read(site, 3);
+    if !matches!(verify.as_deref(), Some([0x83, 0xF8, v]) if *v == max) {
+        let _ = p.write_code(site + 2, &[old]);
+        return Err("新生轉生最大人數寫入後驗證失敗".into());
+    }
+    Ok(())
+}
+
+pub fn reset_freshman_reincarnation(p: &Proc) -> Result<(), String> {
+    let (old_rate, old_max) = freshman_reincarnation_settings(p)?;
+    set_freshman_reincarnation_rate(p, FRESHMAN_REINCARNATION_RATE_DEFAULT)?;
+    if let Err(e) = set_freshman_reincarnation_max(p, FRESHMAN_REINCARNATION_MAX_DEFAULT) {
+        let _ = set_freshman_reincarnation_rate(p, old_rate);
+        let _ = set_freshman_reincarnation_max(p, old_max);
+        return Err(e);
+    }
+    Ok(())
+}
+
 // ── 新生招募成功率 100%：純資料表 patch
 //
 // 2026-09-13 重新逆向確認 FUN_1465C64A0 的實際公式：
