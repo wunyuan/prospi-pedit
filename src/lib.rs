@@ -1520,7 +1520,7 @@ pub fn set_talent_rate(p: &Proc, rate: u8) -> Result<(), String> {
 //
 // Mode 1（地區轉生）：exe+0xB18A440 起每 3 bytes 一組，+1=機率、+2=最大人數，共 6 組。
 // 原始值依來源池數量為 10/12/14/16/18/20%，最大人數皆為 2。
-// Mode 0（新生轉生）：exe+0xB1145BE = 機率；exe+0x637BD98 = `83 F8 xx`，imm8 是最大人數。
+// Mode 0（新生轉生）：exe+0xB1145BE = 機率；每年 4 月 quota 在 exe+0x63805A9 (`83 F9 xx`)；開檔 quota 在 exe+0x637BD98 (`83 F8 xx`)。
 pub const REGION_REINCARNATION_TABLE_RVA: usize = 0x0B18_A440;
 pub const REGION_REINCARNATION_RATE_RVAS: [usize; 6] = [
     0x0B18_A441, 0x0B18_A444, 0x0B18_A447,
@@ -1534,9 +1534,13 @@ pub const REGION_REINCARNATION_RATE_ORIG: [u8; 6] = [10, 12, 14, 16, 18, 20];
 pub const REGION_REINCARNATION_MAX_ORIG: [u8; 6] = [2; 6];
 
 pub const FRESHMAN_REINCARNATION_RATE_RVA: usize = 0x0B11_45BE;
-pub const FRESHMAN_REINCARNATION_MAX_CMP_RVA: usize = 0x0637_BD98;
+/// 每年 4 月新生入學：`CMP ECX, imm8`（VA 0x1463805A9），imm8 位於 +2。
+pub const FRESHMAN_REINCARNATION_MAX_CMP_RVA: usize = 0x0638_05A9;
+/// 開新檔首次新生生成：`CMP EAX, imm8`（VA 0x14637BD98），imm8 位於 +2。
+pub const INITIAL_FRESHMAN_REINCARNATION_MAX_CMP_RVA: usize = 0x0637_BD98;
 pub const FRESHMAN_REINCARNATION_RATE_DEFAULT: u8 = 10;
 pub const FRESHMAN_REINCARNATION_MAX_DEFAULT: u8 = 3;
+pub const INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT: u8 = 3;
 
 #[derive(Clone, Debug)]
 pub struct RegionReincarnationSettings {
@@ -1684,7 +1688,7 @@ pub fn reset_region_reincarnation(p: &Proc) -> Result<(), String> {
     Ok(())
 }
 
-pub fn freshman_reincarnation_settings(p: &Proc) -> Result<(u8, u8), String> {
+pub fn freshman_reincarnation_settings(p: &Proc) -> Result<(u8, u8, u8), String> {
     if p.base == 0 {
         return Err("遊戲模組基址無效".into());
     }
@@ -1694,25 +1698,43 @@ pub fn freshman_reincarnation_settings(p: &Proc) -> Result<(u8, u8), String> {
     if rate > 100 {
         return Err(format!("新生轉生機率目前值異常：{rate}"));
     }
-    let site = p.base + FRESHMAN_REINCARNATION_MAX_CMP_RVA;
-    let cur = p.read(site, 3).ok_or("讀不到新生轉生最大人數指令")?;
-    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+
+    // 每年 4 月新生入學：1463805A9 = 83 F9 03 (CMP ECX,03)
+    let yearly_site = p.base + FRESHMAN_REINCARNATION_MAX_CMP_RVA;
+    let yearly = p.read(yearly_site, 3).ok_or("讀不到新生轉生最大人數指令")?;
+    if yearly.len() != 3 || yearly[0] != 0x83 || yearly[1] != 0xF9 {
         return Err(format!(
-            "遊戲版本可能已更新，找不到預期的 CMP EAX, imm8（exe+0x{:X}）",
+            "遊戲版本可能已更新，找不到預期的 CMP ECX, imm8（exe+0x{:X}）",
             FRESHMAN_REINCARNATION_MAX_CMP_RVA
         ));
     }
-    if !(1..=10).contains(&cur[2]) {
-        return Err(format!("新生轉生最大人數目前值異常：{}", cur[2]));
+    if !(1..=10).contains(&yearly[2]) {
+        return Err(format!("新生轉生最大人數目前值異常：{}", yearly[2]));
     }
-    Ok((rate, cur[2]))
+
+    // 開新檔首次新生：14637BD98 = 83 F8 03 (CMP EAX,03)
+    let initial_site = p.base + INITIAL_FRESHMAN_REINCARNATION_MAX_CMP_RVA;
+    let initial = p.read(initial_site, 3).ok_or("讀不到開檔新生轉生最大人數指令")?;
+    if initial.len() != 3 || initial[0] != 0x83 || initial[1] != 0xF8 {
+        return Err(format!(
+            "遊戲版本可能已更新，找不到預期的 CMP EAX, imm8（exe+0x{:X}）",
+            INITIAL_FRESHMAN_REINCARNATION_MAX_CMP_RVA
+        ));
+    }
+    // 寫入功能限制為 1..=7；讀取時額外容許 8..=10，
+    // 讓舊版修改器曾寫入較大值時仍能使用「恢復原始設定」。
+    if !(1..=10).contains(&initial[2]) {
+        return Err(format!("開檔新生轉生最大人數目前值異常：{}", initial[2]));
+    }
+
+    Ok((rate, yearly[2], initial[2]))
 }
 
 pub fn set_freshman_reincarnation_rate(p: &Proc, rate: u8) -> Result<(), String> {
     if rate > 100 {
         return Err("新生轉生出現機率必須介於 0～100".into());
     }
-    let (old, _) = freshman_reincarnation_settings(p)?;
+    let (old, _, _) = freshman_reincarnation_settings(p)?;
     if !write_static_u8(p, p.base + FRESHMAN_REINCARNATION_RATE_RVA, rate) {
         return Err("無法寫入新生轉生出現機率".into());
     }
@@ -1728,30 +1750,71 @@ pub fn set_freshman_reincarnation_max(p: &Proc, max: u8) -> Result<(), String> {
     if !(1..=10).contains(&max) {
         return Err("新生轉生最大人數必須介於 1～10".into());
     }
-    let (_, old) = freshman_reincarnation_settings(p)?;
+    let (_, old, _) = freshman_reincarnation_settings(p)?;
     let site = p.base + FRESHMAN_REINCARNATION_MAX_CMP_RVA;
     let cur = p.read(site, 3).ok_or("讀不到新生轉生最大人數指令")?;
-    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
-        return Err("新生轉生最大人數修改失敗：遊戲版本可能已更新，找不到預期的 CMP EAX, imm8".into());
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF9 {
+        return Err("新生轉生最大人數修改失敗：遊戲版本可能已更新，找不到預期的 CMP ECX, imm8".into());
     }
     if !p.write_code(site + 2, &[max]) {
         return Err("無法寫入新生轉生最大人數".into());
     }
     let verify = p.read(site, 3);
-    if !matches!(verify.as_deref(), Some([0x83, 0xF8, v]) if *v == max) {
+    if !matches!(verify.as_deref(), Some([0x83, 0xF9, v]) if *v == max) {
         let _ = p.write_code(site + 2, &[old]);
         return Err("新生轉生最大人數寫入後驗證失敗".into());
     }
     Ok(())
 }
 
+pub fn set_initial_freshman_reincarnation_max(p: &Proc, max: u8) -> Result<(), String> {
+    if !(1..=7).contains(&max) {
+        return Err("開檔新生轉生最大人數必須介於 1～7".into());
+    }
+    let (_, _, old) = freshman_reincarnation_settings(p)?;
+    let site = p.base + INITIAL_FRESHMAN_REINCARNATION_MAX_CMP_RVA;
+    let cur = p.read(site, 3).ok_or("讀不到開檔新生轉生最大人數指令")?;
+    if cur.len() != 3 || cur[0] != 0x83 || cur[1] != 0xF8 {
+        return Err("開檔新生轉生最大人數修改失敗：遊戲版本可能已更新，找不到預期的 CMP EAX, imm8".into());
+    }
+    if !p.write_code(site + 2, &[max]) {
+        return Err("無法寫入開檔新生轉生最大人數".into());
+    }
+    let verify = p.read(site, 3);
+    if !matches!(verify.as_deref(), Some([0x83, 0xF8, v]) if *v == max) {
+        let _ = p.write_code(site + 2, &[old]);
+        return Err("開檔新生轉生最大人數寫入後驗證失敗".into());
+    }
+    Ok(())
+}
+
 pub fn reset_freshman_reincarnation(p: &Proc) -> Result<(), String> {
-    let (old_rate, old_max) = freshman_reincarnation_settings(p)?;
+    let (old_rate, old_max, old_initial_max) = freshman_reincarnation_settings(p)?;
+
     set_freshman_reincarnation_rate(p, FRESHMAN_REINCARNATION_RATE_DEFAULT)?;
     if let Err(e) = set_freshman_reincarnation_max(p, FRESHMAN_REINCARNATION_MAX_DEFAULT) {
         let _ = set_freshman_reincarnation_rate(p, old_rate);
-        let _ = set_freshman_reincarnation_max(p, old_max);
         return Err(e);
+    }
+    if let Err(e) = set_initial_freshman_reincarnation_max(p, INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT) {
+        // 三項視為同一組 restore；第三項失敗時盡量回滾前兩項到 restore 前狀態。
+        let _ = set_freshman_reincarnation_rate(p, old_rate);
+        let _ = set_freshman_reincarnation_max(p, old_max);
+        let _ = set_initial_freshman_reincarnation_max(p, old_initial_max);
+        return Err(e);
+    }
+
+    let after = freshman_reincarnation_settings(p)?;
+    if after != (
+        FRESHMAN_REINCARNATION_RATE_DEFAULT,
+        FRESHMAN_REINCARNATION_MAX_DEFAULT,
+        INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT,
+    ) {
+        // 驗證失敗也盡量回到使用者按 restore 前的狀態。
+        let _ = set_freshman_reincarnation_rate(p, old_rate);
+        let _ = set_freshman_reincarnation_max(p, old_max);
+        let _ = set_initial_freshman_reincarnation_max(p, old_initial_max);
+        return Err("新生轉生恢復後驗證失敗".into());
     }
     Ok(())
 }

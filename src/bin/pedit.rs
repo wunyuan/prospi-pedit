@@ -264,8 +264,10 @@ struct App {
     region_reincarnation_rate_original: bool,
     /// 新生入學轉生機率。
     freshman_reincarnation_rate: u8,
-    /// 新生入學轉生最大人數。
+    /// 每年 4 月新生入學的轉生最大人數（1..=10）。
     freshman_reincarnation_max: u8,
+    /// 開新檔首次新生生成的轉生最大人數（1..=7）。
+    initial_freshman_reincarnation_max: u8,
     /// 上一次已讀取的 Region；即使結果是空的也不會每幀重掃。
     recruit_loaded_region: Option<usize>,
     /// 新生招募：目前地區的候選人（保留原始 candidate index 0..9）。
@@ -358,9 +360,13 @@ impl App {
         let initial_region_max = initial_region.as_ref().and_then(|s| s.uniform_max()).unwrap_or(2);
         let initial_region_original = initial_region.as_ref().is_some_and(|s| s.is_original());
         let initial_region_rate_original = initial_region.as_ref().is_some_and(|s| s.rate_is_original());
-        let (initial_freshman_rate, initial_freshman_max) = proc.as_ref()
+        let (initial_freshman_rate, initial_freshman_max, initial_opening_freshman_max) = proc.as_ref()
             .and_then(|p| freshman_reincarnation_settings(p).ok())
-            .unwrap_or((FRESHMAN_REINCARNATION_RATE_DEFAULT, FRESHMAN_REINCARNATION_MAX_DEFAULT));
+            .unwrap_or((
+                FRESHMAN_REINCARNATION_RATE_DEFAULT,
+                FRESHMAN_REINCARNATION_MAX_DEFAULT,
+                INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT,
+            ));
         let mut app = App {
             proc,
             err,
@@ -376,6 +382,7 @@ impl App {
             region_reincarnation_rate_original: initial_region_rate_original,
             freshman_reincarnation_rate: initial_freshman_rate,
             freshman_reincarnation_max: initial_freshman_max,
+            initial_freshman_reincarnation_max: initial_opening_freshman_max,
             recruit_loaded_region: None,
             recruit_list: Vec::new(),
             recruit_sel: None,
@@ -469,13 +476,15 @@ impl App {
                     }
                 }
                 match freshman_reincarnation_settings(&p) {
-                    Ok((rate, max)) => {
+                    Ok((rate, max, opening_max)) => {
                         self.freshman_reincarnation_rate = rate;
                         self.freshman_reincarnation_max = max;
+                        self.initial_freshman_reincarnation_max = opening_max;
                     }
                     Err(_) => {
                         self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
                         self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
+                        self.initial_freshman_reincarnation_max = INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT;
                     }
                 }
                 self.proc = Some(p);
@@ -1825,16 +1834,42 @@ impl eframe::App for App {
                             self.status = "尚未附加遊戲行程，無法修改新生轉生最大人數".into();
                         }
                     }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("開檔新生轉生最大人數");
+                    let mut v = self.initial_freshman_reincarnation_max.clamp(1, 7);
+                    let slider_changed = ui
+                        .add(egui::Slider::new(&mut v, 1..=7).show_value(false))
+                        .changed();
+                    let input_changed = ui
+                        .add(egui::DragValue::new(&mut v).range(1..=7).speed(1.0))
+                        .changed();
+                    ui.label("人");
+                    if slider_changed || input_changed {
+                        if let Some(p) = self.proc.as_ref() {
+                            match set_initial_freshman_reincarnation_max(p, v) {
+                                Ok(()) => {
+                                    self.initial_freshman_reincarnation_max = v;
+                                    self.status = format!("開檔新生轉生最大人數 → {v} 人");
+                                }
+                                Err(e) => self.status = format!("開檔新生轉生最大人數修改失敗：{e}"),
+                            }
+                        } else {
+                            self.status = "尚未附加遊戲行程，無法修改開檔新生轉生最大人數".into();
+                        }
+                    }
                     if ui.button("恢復原始設定").clicked() {
                         if let Some(p) = self.proc.as_ref() {
                             match reset_freshman_reincarnation(p) {
                                 Ok(()) => {
                                     self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
                                     self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
+                                    self.initial_freshman_reincarnation_max = INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT;
                                     self.status = format!(
-                                        "新生轉生已恢復原始設定：{}% / {}人",
+                                        "新生轉生已恢復原始設定：{}% / 每年 {}人 / 開檔 {}人",
                                         FRESHMAN_REINCARNATION_RATE_DEFAULT,
-                                        FRESHMAN_REINCARNATION_MAX_DEFAULT
+                                        FRESHMAN_REINCARNATION_MAX_DEFAULT,
+                                        INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT
                                     );
                                 }
                                 Err(e) => self.status = format!("新生轉生恢復失敗：{e}"),
@@ -3807,7 +3842,7 @@ impl App {
 // 1. 若本次 UI 仍勾選「招募機率100%」，自動取消並還原兩張招募機率資料表。
 // 2. 若遊戲 process 仍存活，將天才出現機率恢復為遊戲原生 1%。
 // 3. 地區轉生恢復為遊戲原始六階梯：10/12/14/16/18/20%，最大 2 人。
-// 4. 新生轉生恢復為遊戲原始設定：10%，最大 3 人。
+// 4. 新生轉生恢復為遊戲原始設定：10%，每年 4 月最大 3 人，開檔最大 3 人。
 // 不做任何啟動時或無條件的招募機率資料 reset；lib 端只還原本 instance 成功套用且仍符合 patched 值的欄位。
 impl Drop for App {
     fn drop(&mut self) {
@@ -3827,6 +3862,7 @@ impl Drop for App {
         self.region_reincarnation_rate_original = true;
         self.freshman_reincarnation_rate = FRESHMAN_REINCARNATION_RATE_DEFAULT;
         self.freshman_reincarnation_max = FRESHMAN_REINCARNATION_MAX_DEFAULT;
+        self.initial_freshman_reincarnation_max = INITIAL_FRESHMAN_REINCARNATION_MAX_DEFAULT;
     }
 }
 
